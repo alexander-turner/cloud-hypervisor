@@ -14,6 +14,7 @@ use block::ImageType;
 pub use block::fcntl::LockGranularityChoice;
 #[cfg(target_arch = "x86_64")]
 use devices::debug_console;
+use landlock::AccessFs;
 use log::{debug, warn};
 use net_util::MacAddr;
 use serde::de::{Error as DeError, Visitor};
@@ -935,7 +936,10 @@ pub struct VsockConfig {
 impl ApplyLandlock for VsockConfig {
     fn apply_landlock(&self, landlock: &mut Landlock) -> LandlockResult<()> {
         if let Some(parent) = self.socket.parent() {
-            landlock.add_rule_with_access(parent, "w")?;
+            // The socket does not exist until the VMM binds it, so its parent
+            // directory gets the one right bind needs. A wider right there would
+            // reach every file below that directory.
+            landlock.add_rule(parent, AccessFs::MakeSock.into())?;
         }
 
         landlock.add_rule_with_access(&self.socket, "rw")?;
