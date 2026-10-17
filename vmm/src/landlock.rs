@@ -5,11 +5,13 @@
 use std::convert::TryFrom;
 use std::io::Error as IoError;
 use std::path::Path;
+#[cfg(test)]
+use std::ptr;
 
 #[cfg(test)]
 use landlock::make_bitflags;
 use landlock::{
-    ABI, Access, AccessFs, BitFlags, Compatible, Ruleset, RulesetAttr, RulesetCreated,
+    ABI, Access, AccessFs, BitFlags, CompatLevel, Compatible, Ruleset, RulesetAttr, RulesetCreated,
     RulesetCreatedAttr, RulesetError, path_beneath_rules,
 };
 use thiserror::Error;
@@ -34,7 +36,10 @@ pub enum LandlockError {
 }
 
 // https://docs.rs/landlock/latest/landlock/enum.ABI.html for more info on ABI
-static ABI: ABI = ABI::V3;
+// A kernel without the rights of ABI_FLOOR makes Landlock::new() fail.
+static ABI_FLOOR: ABI = ABI::V3;
+// Rights newer than ABI_FLOOR, up to ABI, are used only where the kernel has them.
+static ABI: ABI = ABI::V9;
 
 #[derive(Debug)]
 pub(crate) struct LandlockAccess {
@@ -54,7 +59,12 @@ impl TryFrom<&str> for LandlockAccess {
         let mut access = BitFlags::<AccessFs>::empty();
         for c in s.chars() {
             match c {
-                'r' => access |= AccessFs::from_read(ABI),
+                // IoctlDev is also granted with 'r': CH queries the size of a
+                // read-only block device with BLKGETSIZE64, and the kernel
+                // refuses BLKDISCARD and BLKZEROOUT on a read-only fd.
+                'r' => access |= AccessFs::from_read(ABI) | AccessFs::IoctlDev,
+                // From ABI V5 this includes IoctlDev, and from ABI V9 it
+                // includes ResolveUnix (connect to a pathname UNIX socket).
                 'w' => access |= AccessFs::from_write(ABI),
                 _ => {
                     return Err(LandlockError::InvalidLandlockAccess(
@@ -72,16 +82,17 @@ pub struct Landlock {
 
 impl Landlock {
     pub fn new() -> Result<Landlock, LandlockError> {
-        let file_access = AccessFs::from_all(ABI);
-
+        // The ABI_FLOOR rights are a hard requirement. The newer rights are
+        // best effort: the kernel handles the ones it supports, and rules
+        // drop the ones it does not, so an older kernel behaves as before.
         let def_ruleset = Ruleset::default()
-            .set_compatibility(landlock::CompatLevel::HardRequirement)
-            .handle_access(file_access)
+            .set_compatibility(CompatLevel::HardRequirement)
+            .handle_access(AccessFs::from_all(ABI_FLOOR))
             .map_err(LandlockError::ManageRuleset)?
-            .set_compatibility(landlock::CompatLevel::HardRequirement);
+            .set_compatibility(CompatLevel::BestEffort)
+            .handle_access(AccessFs::from_all(ABI))
+            .map_err(LandlockError::ManageRuleset)?;
 
-        // By default, rulesets are created in `BestEffort` mode. This lets Landlock
-        // to enable all the supported rules and silently ignore the unsupported ones.
         let ruleset = def_ruleset.create().map_err(LandlockError::ManageRuleset)?;
 
         Ok(Landlock { ruleset })
@@ -125,6 +136,7 @@ fn test_try_from_access() {
         Execute
         | ReadFile
         | ReadDir
+        | IoctlDev
     });
     let write_access = make_bitflags!(AccessFs::{
         WriteFile
@@ -139,6 +151,8 @@ fn test_try_from_access() {
         | MakeSym
         | Refer
         | Truncate
+        | IoctlDev
+        | ResolveUnix
     });
     let landlock_access = LandlockAccess::try_from("rw").unwrap();
     assert_eq!(landlock_access.access, read_access | write_access);
@@ -150,4 +164,25 @@ fn test_try_from_access() {
     assert_eq!(landlock_access.access, write_access);
 
     LandlockAccess::try_from("").unwrap_err();
+}
+
+#[test]
+fn test_new_requires_abi_floor() {
+    // SAFETY: a NULL attr with LANDLOCK_CREATE_RULESET_VERSION only returns the
+    // kernel's Landlock ABI version, or -1.
+    let kernel_abi = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            ptr::null::<libc::c_void>(),
+            0usize,
+            1u32, // LANDLOCK_CREATE_RULESET_VERSION
+        )
+    };
+    let landlock = Landlock::new();
+    assert_eq!(landlock.is_ok(), kernel_abi >= 3, "kernel ABI {kernel_abi}");
+
+    // Rights newer than the kernel's ABI must not make a rule fail.
+    if let Ok(mut landlock) = landlock {
+        landlock.add_rule_with_access(Path::new("/"), "rw").unwrap();
+    }
 }
