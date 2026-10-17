@@ -9,18 +9,33 @@ permissions:
 
 jobs:
   landlock:
-    name: landlock (${{ matrix.branch }})
+    name: landlock (${{ matrix.name }})
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        branch:
-          - main
-          - landlock-readonly-disk
-          - landlock-vsock-dir-makesock
-          - landlock-flag-without-payload
-          - landlock-newer-abi
+        include:
+          # main's code plus the integration test each PR branch adds, to
+          # show which new tests fail without the fix.
+          - name: main-with-new-tests
+            branch: main
+            tests_from: >-
+              landlock-readonly-disk landlock-vsock-dir-makesock
+              landlock-flag-without-payload landlock-newer-abi
+          - name: landlock-readonly-disk
+            branch: landlock-readonly-disk
+          - name: landlock-vsock-dir-makesock
+            branch: landlock-vsock-dir-makesock
+          - name: landlock-flag-without-payload
+            branch: landlock-flag-without-payload
+          - name: landlock-newer-abi
+            branch: landlock-newer-abi
+          # landlock-newer-abi with IoctlDev removed from the "r" access, to
+          # show test_landlock_block_device_ioctl fails without that grant.
+          - name: landlock-newer-abi-mutant-no-ioctldev-on-read
+            branch: landlock-newer-abi
+            mutant: no-ioctldev-on-read
     env:
       # Every integration test that passes --landlock: the name filter catches
       # the ones with "landlock" in their name; test_serial_socket_stale_cleanup
@@ -33,6 +48,27 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ matrix.branch }}
+
+      - name: Add the new integration tests from the PR branches
+        if: matrix.tests_from != ''
+        env:
+          TESTS_FROM: ${{ matrix.tests_from }}
+        run: |
+          set -eux
+          for b in $TESTS_FROM; do
+            git fetch --no-tags --depth=1 origin "$b"
+            git diff HEAD FETCH_HEAD -- cloud-hypervisor/tests | git apply --3way
+          done
+          git diff --cached --stat
+
+      - name: Mutate (no IoctlDev on the "r" access)
+        if: matrix.mutant == 'no-ioctldev-on-read'
+        run: |
+          set -eux
+          f=vmm/src/landlock.rs
+          grep -q 'AccessFs::from_read(ABI) | AccessFs::IoctlDev' "$f"
+          sed -i 's/AccessFs::from_read(ABI) | AccessFs::IoctlDev/AccessFs::from_read(ABI)/' "$f"
+          git diff
 
       - name: Free disk space
         run: |
@@ -116,6 +152,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: junit-${{ matrix.branch }}
+          name: junit-${{ matrix.name }}
           path: ~/workloads/junit/
           if-no-files-found: warn
