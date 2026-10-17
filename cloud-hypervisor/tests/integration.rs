@@ -42,6 +42,7 @@ mod common_parallel {
     use std::io::{self, SeekFrom};
     use std::num::NonZeroU32;
     use std::process::Command;
+    use std::ptr;
     use std::time::{Duration, Instant};
 
     use test_infra::GuestFactory;
@@ -756,6 +757,75 @@ mod common_parallel {
     #[test]
     fn test_virtio_block_blkdev_sync() {
         _test_virtio_block_blkdev(true, true);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    // From Landlock ABI 5 the kernel also checks ioctl on device files. A
+    // block device granted only "r" must still hot-plug: the VMM sizes it
+    // with BLKGETSIZE64 and reads its topology with BLKSSZGET, BLKPBSZGET
+    // and BLKIOMIN, which the kernel refuses unless "r" grants IoctlDev.
+    // A hot-plugged disk is opened after Landlock is applied, at boot it
+    // is not. Older kernels do not check these ioctls, so the test skips.
+    fn test_landlock_block_device_ioctl() {
+        // SAFETY: a NULL attr with LANDLOCK_CREATE_RULESET_VERSION only
+        // returns the kernel's Landlock ABI version, or -1.
+        let abi = unsafe {
+            libc::syscall(
+                libc::SYS_landlock_create_ruleset,
+                ptr::null::<libc::c_void>(),
+                0usize,
+                1u32, // LANDLOCK_CREATE_RULESET_VERSION
+            )
+        };
+        if abi < 5 {
+            println!("SKIPPED: Landlock ABI {abi} does not check device ioctls");
+            return;
+        }
+
+        let guest = basic_regular_guest!(JAMMY_IMAGE_NAME);
+        let api_socket = temp_api_path(&guest.tmp_dir);
+        let loopdev = LoopDev::new(guest.tmp_dir.as_path(), 16);
+
+        let mut child = GuestCommand::new(&guest)
+            .args(["--api-socket", &api_socket])
+            .default_cpus()
+            .default_memory()
+            .default_kernel_cmdline()
+            .args(["--landlock"])
+            .args([
+                "--landlock-rules",
+                format!("path={},access=r", loopdev.path).as_str(),
+            ])
+            .default_disks()
+            .default_net()
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        let r = panic::catch_unwind(|| {
+            guest.wait_vm_boot().unwrap();
+
+            let (cmd_success, _, cmd_stderr) = remote_command_w_output(
+                &api_socket,
+                "add-disk",
+                Some(format!("path={},id=test0,readonly=on,image_type=raw", loopdev.path).as_str()),
+            );
+            assert!(cmd_success, "{}", String::from_utf8_lossy(&cmd_stderr));
+            assert!(wait_until(Duration::from_secs(10), || {
+                guest
+                    .ssh_command("lsblk | grep vdc | grep -c 16M")
+                    .is_ok_and(|s| s.trim().parse::<u32>().unwrap_or_default() == 1)
+            }));
+            guest
+                .ssh_command("sudo dd if=/dev/vdc of=/dev/null bs=1M iflag=direct count=16")
+                .unwrap();
+        });
+
+        kill_child(&mut child);
+        let output = child.wait_with_output().unwrap();
+
+        handle_child_output(r, &output);
     }
 
     #[test]
