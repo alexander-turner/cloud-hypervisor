@@ -42,7 +42,6 @@ mod common_parallel {
     use std::io::{self, SeekFrom};
     use std::num::NonZeroU32;
     use std::process::Command;
-    use std::ptr;
     use std::time::{Duration, Instant};
 
     use test_infra::GuestFactory;
@@ -768,6 +767,8 @@ mod common_parallel {
     // A hot-plugged disk is opened after Landlock is applied, at boot it
     // is not. Older kernels do not check these ioctls, so the test skips.
     fn test_landlock_block_device_ioctl() {
+        use std::ptr;
+
         // SAFETY: a NULL attr with LANDLOCK_CREATE_RULESET_VERSION only
         // returns the kernel's Landlock ABI version, or -1.
         let abi = unsafe {
