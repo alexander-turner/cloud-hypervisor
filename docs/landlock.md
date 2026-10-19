@@ -14,6 +14,21 @@ additional accesses (eg: for now, access to extended file attributes is always
 allowed). Eventually, Landlock will only allow accesses similar to Unix
 permissions.
 
+## Landlock ABI versions
+
+Cloud Hypervisor needs Landlock ABI 3 (Linux 6.2) or newer. If the host kernel
+offers newer rights, Cloud Hypervisor also uses them:
+
+* ABI 5 (Linux 6.10): `ioctl` on device files. Both `r` and `w` grant it.
+* ABI 9 (Linux 7.1): `connect` to pathname UNIX sockets. `w` grants it.
+
+With ABI 9, a UNIX socket that Cloud Hypervisor connects to after the VM is
+created needs a `w` rule, like any other path accessed after that point. This
+includes the socket of a hot-plugged vhost-user or vfio-user device, and the
+destination socket of a `unix:` live migration.
+
+Cloud Hypervisor does not use the TCP rights (ABI 4) or the scopes (ABI 6).
+
 ## Host Setup
 
 Landlock should be enabled in host kernel to use it with cloud-hypervisor.

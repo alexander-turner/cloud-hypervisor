@@ -493,6 +493,9 @@ impl ApplyLandlock for DiskConfig {
         if let Some(path) = &self.path {
             landlock.add_rule_with_access(path, "rw")?;
         }
+        if let Some(socket) = &self.vhost_socket {
+            landlock.add_rule_with_access(Path::new(socket), "rw")?;
+        }
         Ok(())
     }
 }
@@ -553,6 +556,15 @@ pub struct NetConfig {
     pub offload_ufo: bool,
     #[serde(default)]
     pub offload_csum: bool,
+}
+
+impl ApplyLandlock for NetConfig {
+    fn apply_landlock(&self, landlock: &mut Landlock) -> LandlockResult<()> {
+        if let Some(socket) = &self.vhost_socket {
+            landlock.add_rule_with_access(Path::new(socket), "rw")?;
+        }
+        Ok(())
+    }
 }
 
 pub fn default_netconfig_tap() -> Option<String> {
@@ -1375,8 +1387,11 @@ impl VmConfig {
             tpm_config.apply_landlock(&mut landlock)?;
         }
 
-        if self.net.is_some() {
+        if let Some(net_configs) = &self.net {
             landlock.add_rule_with_access(Path::new("/dev/net/tun"), "rw")?;
+            for net_config in net_configs.iter() {
+                net_config.apply_landlock(&mut landlock)?;
+            }
         }
 
         if let Some(landlock_rules) = &self.landlock_rules {
