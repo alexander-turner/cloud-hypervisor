@@ -3316,10 +3316,9 @@ mod common_parallel {
 
     #[test]
     #[cfg(target_arch = "x86_64")]
-    // A VMM started with only --api-socket and --landlock gets its VM config
-    // later through vm.create, as Kata runtime-rs does. The VM it creates
-    // with Landlock enabled must boot, and a disk outside the Landlock rules
-    // must still be refused.
+    // Start the VMM with only --api-socket and --landlock, create and boot
+    // a VM with Landlock enabled through the API, and check that a disk
+    // outside the Landlock rules is refused.
     fn test_api_create_boot_landlock() {
         let guest = basic_regular_guest!(JAMMY_IMAGE_NAME);
         let api_socket = temp_api_path(&guest.tmp_dir);
