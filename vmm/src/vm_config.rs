@@ -936,9 +936,6 @@ pub struct VsockConfig {
 impl ApplyLandlock for VsockConfig {
     fn apply_landlock(&self, landlock: &mut Landlock) -> LandlockResult<()> {
         if let Some(parent) = self.socket.parent() {
-            // The socket does not exist until the VMM binds it, so its parent
-            // directory gets the one right bind needs. A wider right there would
-            // reach every file below that directory.
             landlock.add_rule(parent, AccessFs::MakeSock.into())?;
         }
 
