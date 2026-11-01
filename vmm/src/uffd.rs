@@ -203,6 +203,33 @@ pub(crate) fn copy(fd: BorrowedFd<'_>, dst: u64, src: *const u8, len: u64) -> Re
     }
 }
 
+/// Allocate a zero-filled buffer to resolve UFFD faults with.
+pub(crate) fn allocate_zero_buffer(len: usize) -> Vec<u8> {
+    let buf = vec![0u8; len];
+
+    // Ensure the page tables of the buffer exist, so UFFDIO_COPY works
+    // with it on 1 GiB pages.
+    // SAFETY: FFI call. Trivially safe.
+    let base_page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+    let start = buf.as_ptr() as usize & !(base_page_size - 1);
+    // SAFETY: the range only covers pages backing `buf`.
+    let ret = unsafe {
+        libc::madvise(
+            start as *mut libc::c_void,
+            buf.as_ptr() as usize + buf.len() - start,
+            libc::MADV_POPULATE_READ,
+        )
+    };
+    if ret != 0 {
+        log::warn!(
+            "UFFD handler: failed to populate zero buffer: {}",
+            io::Error::last_os_error()
+        );
+    }
+
+    buf
+}
+
 /// Resolves a minor page fault by installing PTEs for a range.
 pub(crate) fn uffd_continue(fd: BorrowedFd<'_>, dst: u64, len: u64) -> Result<(), Error> {
     let mut cont = UffdioContinue {
@@ -239,6 +266,13 @@ struct UffdioRange {
 }
 
 #[repr(C)]
+struct UffdioZeropage {
+    range: UffdioRange,
+    mode: u64,
+    zeropage: i64,
+}
+
+#[repr(C)]
 struct UffdioPoison {
     range: UffdioRange,
     mode: u64,
@@ -271,6 +305,48 @@ impl UffdRange {
         let page_addr = addr & !(self.page_size - 1);
         (page_addr >= self.host_addr && page_addr < self.host_addr + self.length)
             .then(|| (page_addr - self.host_addr) / self.page_size)
+    }
+}
+
+/// A userfaultfd and the ranges registered in it, at the addresses they are
+/// mapped at in the process owning it.
+pub(crate) struct Uffd {
+    fd: OwnedFd,
+    ranges: Box<[UffdRange]>,
+}
+
+impl Uffd {
+    pub(crate) fn new(fd: OwnedFd, ranges: Box<[UffdRange]>) -> Result<Self, Error> {
+        // SAFETY: `F_GETFL` takes no argument.
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0 {
+            return Err(Error::last_os_error());
+        }
+        // SAFETY: `F_SETFL` takes an integer argument, no pointer.
+        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(Error::last_os_error());
+        }
+        Ok(Self { fd, ranges })
+    }
+
+    pub(crate) fn fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+
+    pub(crate) fn ranges(&self) -> &[UffdRange] {
+        &self.ranges
+    }
+
+    /// Returns the `(range_idx, page_idx)` containing `addr`.
+    pub(crate) fn locate(&self, addr: u64) -> Option<(usize, u64)> {
+        self.ranges
+            .iter()
+            .enumerate()
+            .find_map(|(range_idx, range)| {
+                range
+                    .page_index_of(addr)
+                    .map(|page_idx| (range_idx, page_idx))
+            })
     }
 }
 
@@ -442,6 +518,34 @@ fn io_other<E: fmt::Display>(e: E) -> io::Error {
     io::Error::other(e.to_string())
 }
 
+/// Resolve a missing page fault by mapping a zero-filled page.
+pub(crate) fn zeropage(fd: BorrowedFd<'_>, addr: u64, len: u64) -> Result<(), Error> {
+    let mut zp = UffdioZeropage {
+        range: UffdioRange { start: addr, len },
+        mode: 0,
+        zeropage: 0,
+    };
+    loop {
+        // SAFETY: `zp` is a valid, correctly-sized struct for this ioctl.
+        let ret = unsafe {
+            libc::ioctl(
+                fd.as_raw_fd(),
+                userfaultfd::UFFDIO_ZEROPAGE as libc::Ioctl,
+                &mut zp,
+            )
+        };
+        if ret >= 0 {
+            return Ok(());
+        }
+
+        let error = Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EAGAIN) {
+            return Err(error);
+        }
+        thread::yield_now();
+    }
+}
+
 /// Mark a missing page so that an access to it fails instead of resolving a
 /// zero page.
 pub(crate) fn poison(fd: BorrowedFd<'_>, addr: u64, len: u64) -> Result<(), Error> {
@@ -473,9 +577,9 @@ pub(crate) fn poison(fd: BorrowedFd<'_>, addr: u64, len: u64) -> Result<(), Erro
 
 /// Wake threads waiting on a fault in the given range without copying data.
 ///
-/// Needed after UFFDIO_COPY or UFFDIO_CONTINUE returns EEXIST: the page was
-/// already resolved by a concurrent fault, but any additional threads blocked
-/// on that page may not have been woken.
+/// Needed after UFFDIO_COPY, UFFDIO_ZEROPAGE or UFFDIO_CONTINUE returns EEXIST:
+/// the page was already resolved by a concurrent fault, but any additional
+/// threads blocked on that page may not have been woken.
 pub(crate) fn wake(fd: BorrowedFd<'_>, addr: u64, len: u64) -> Result<(), Error> {
     let mut range = UffdioRange { start: addr, len };
     // SAFETY: `range` is a valid, correctly-sized struct for this ioctl.
@@ -490,4 +594,17 @@ pub(crate) fn wake(fd: BorrowedFd<'_>, addr: u64, len: u64) -> Result<(), Error>
         return Err(Error::last_os_error());
     }
     Ok(())
+}
+
+/// Returns whether the page at `addr` in this process is present. For a
+/// shared file mapping, this is whether the file holds the page, even if
+/// it is not mapped at `addr`.
+pub(crate) fn page_present(addr: u64) -> Result<bool, Error> {
+    let mut vec = 0u8;
+    // SAFETY: mincore() writes one byte for the single page at `addr`.
+    let ret = unsafe { libc::mincore(addr as *mut libc::c_void, 1, &mut vec) };
+    if ret < 0 {
+        return Err(Error::last_os_error());
+    }
+    Ok(vec & 1 != 0)
 }

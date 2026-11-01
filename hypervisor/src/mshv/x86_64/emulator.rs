@@ -3,6 +3,8 @@
 // Copyright © 2024, Microsoft Corporation
 //
 
+use std::cmp;
+
 use anyhow::anyhow;
 use iced_x86::Register;
 use log::debug;
@@ -13,12 +15,60 @@ use crate::arch::x86::emulator::{CpuStateManager, EmulatorCpuState};
 use crate::cpu::Vcpu;
 use crate::mshv::MshvVcpu;
 
+/// Returns how many bytes of an access at `gva` are in the first page.
+fn first_page_len(gva: u64, len: usize) -> usize {
+    let page_size = HV_HYP_PAGE_SIZE as usize;
+    let page_offset = gva as usize % page_size;
+    let bytes_left_in_page = page_size - page_offset;
+    let first_len = cmp::min(len, bytes_left_in_page);
+    // We only handle one page cross-page access
+    assert!(len - first_len <= page_size);
+    first_len
+}
+
+/// Returns the `HV_TRANSLATE_GVA_VALIDATE_*` checks the guest access behind a
+/// memory intercept of `access_type` has already passed. A write implies the
+/// page is readable as well.
+pub fn intercept_translate_flags(access_type: u8) -> u32 {
+    match u32::from(access_type) {
+        HV_INTERCEPT_ACCESS_READ => HV_TRANSLATE_GVA_VALIDATE_READ,
+        HV_INTERCEPT_ACCESS_WRITE => {
+            HV_TRANSLATE_GVA_VALIDATE_READ | HV_TRANSLATE_GVA_VALIDATE_WRITE
+        }
+        _ => 0,
+    }
+}
+
+/// Returns the GPA for `gva` from the cached intercept `mapping` if it covers
+/// the same page and the intercepted access already passed every check in
+/// `flags`, so the access does not need a translate hypercall.
+fn cached_gpa(
+    mapping: Option<(u64, u64)>,
+    mapping_flags: u32,
+    gva: u64,
+    flags: u32,
+) -> Option<u64> {
+    let page_offset_mask = (HV_HYP_PAGE_SIZE as u64) - 1;
+    let page_base = !page_offset_mask;
+
+    let (cached_gva, cached_gpa) = mapping?;
+    if (cached_gva & page_base) != (gva & page_base) || flags & !mapping_flags != 0 {
+        return None;
+    }
+
+    Some((cached_gpa & page_base) | (gva & page_offset_mask))
+}
+
 pub struct MshvEmulatorContext<'a> {
     pub vcpu: &'a MshvVcpu,
     /// Initial (GVA, GPA) mapping provided by the hypervisor if the hypervisor provided a
     /// valid mapping. Used as a fast path in [`MshvEmulatorContext::translate`] to avoid a
     /// translate hypercall. `None` when the hypervisor did not provide a valid mapping.
     pub mapping: Option<(u64, u64)>,
+    /// `HV_TRANSLATE_GVA_VALIDATE_*` checks the intercepted access passed for `mapping`,
+    /// see [`intercept_translate_flags`]. Accesses needing any other check, such as a
+    /// write through a mapping obtained from a read, are translated by the hypervisor.
+    pub mapping_flags: u32,
 }
 
 impl MshvEmulatorContext<'_> {
@@ -31,10 +81,8 @@ impl MshvEmulatorContext<'_> {
         let page_offset = gva & page_offset_mask;
         let page_base = !page_offset_mask;
 
-        if let Some((cached_gva, cached_gpa)) = self.mapping
-            && (cached_gva & page_base) == (gva & page_base)
-        {
-            return Ok((cached_gpa & page_base) | page_offset);
+        if let Some(gpa) = cached_gpa(self.mapping, self.mapping_flags, gva, flags) {
+            return Ok(gpa);
         }
 
         let (gpa, result_code) = self
@@ -76,25 +124,12 @@ impl MshvEmulatorContext<'_> {
         data: &mut [u8],
         flags: u32,
     ) -> Result<(), PlatformError> {
-        let mut len = data.len() as u64;
+        let len = first_page_len(gva, data.len());
 
-        // Compare the page number of the first and last byte. If they are different, this is a
-        // cross-page access.
-        let pg1 = gva >> HV_HYP_PAGE_SHIFT;
-        let pg2 = (gva + len - 1) >> HV_HYP_PAGE_SHIFT;
-        let cross_page = pg1 != pg2;
+        self.r(gva, &mut data[..len], flags)?;
 
-        if cross_page {
-            // We only handle one page cross-page access
-            assert!(pg1 + 1 == pg2);
-            let n = (gva + len) & HV_HYP_PAGE_MASK as u64;
-            len -= n;
-        }
-
-        self.r(gva, &mut data[..len as usize], flags)?;
-
-        if cross_page {
-            self.r(gva + len, &mut data[len as usize..], flags)?;
+        if len < data.len() {
+            self.r(gva + len as u64, &mut data[len..], flags)?;
         }
 
         Ok(())
@@ -123,8 +158,8 @@ impl MshvEmulatorContext<'_> {
     pub fn update_cpu_state(
         &self,
         cpu_id: usize,
-        old_state: <Self as PlatformEmulator>::CpuState,
-        new_state: <Self as PlatformEmulator>::CpuState,
+        old_state: &<Self as PlatformEmulator>::CpuState,
+        new_state: &<Self as PlatformEmulator>::CpuState,
     ) -> Result<(), PlatformError> {
         if cpu_id != self.vcpu.vp_index as usize {
             return Err(PlatformError::SetCpuStateFailure(anyhow!(
@@ -181,25 +216,12 @@ impl PlatformEmulator for MshvEmulatorContext<'_> {
     }
 
     fn write_memory(&mut self, gva: u64, data: &[u8]) -> Result<(), PlatformError> {
-        let mut len = data.len() as u64;
+        let len = first_page_len(gva, data.len());
 
-        // Compare the page number of the first and last byte. If they are different, this is a
-        // cross-page access.
-        let pg1 = gva >> HV_HYP_PAGE_SHIFT;
-        let pg2 = (gva + len - 1) >> HV_HYP_PAGE_SHIFT;
-        let cross_page = pg1 != pg2;
+        self.w(gva, &data[..len])?;
 
-        if cross_page {
-            // We only handle one page cross-page access
-            assert!(pg1 + 1 == pg2);
-            let n = (gva + len) & HV_HYP_PAGE_MASK as u64;
-            len -= n;
-        }
-
-        self.w(gva, &data[..len as usize])?;
-
-        if cross_page {
-            self.w(gva + len, &data[len as usize..])?;
+        if len < data.len() {
+            self.w(gva + len as u64, &data[len..])?;
         }
 
         Ok(())
@@ -279,5 +301,66 @@ impl PlatformEmulator for MshvEmulatorContext<'_> {
             instruction_bytes,
             HV_TRANSLATE_GVA_VALIDATE_READ | HV_TRANSLATE_GVA_VALIDATE_EXECUTE,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_first_page_len() {
+        assert_eq!(first_page_len(0x1000, 8), 8);
+        assert_eq!(first_page_len(0x1ff8, 8), 8);
+        assert_eq!(first_page_len(0x1ff8, 16), 8);
+        assert_eq!(first_page_len(0x1fff, 2), 1);
+    }
+
+    #[test]
+    fn test_cached_gpa_requires_intercept_validation() {
+        let mapping = Some((0x7000_1010, 0xd000_0010));
+        let read = intercept_translate_flags(HV_INTERCEPT_ACCESS_READ as u8);
+        let write = intercept_translate_flags(HV_INTERCEPT_ACCESS_WRITE as u8);
+        let fetch = HV_TRANSLATE_GVA_VALIDATE_READ | HV_TRANSLATE_GVA_VALIDATE_EXECUTE;
+
+        // A read intercept only vouches for reads of that page.
+        assert_eq!(
+            cached_gpa(mapping, read, 0x7000_1020, HV_TRANSLATE_GVA_VALIDATE_READ),
+            Some(0xd000_0020)
+        );
+        assert_eq!(
+            cached_gpa(mapping, read, 0x7000_1020, HV_TRANSLATE_GVA_VALIDATE_WRITE),
+            None
+        );
+        assert_eq!(cached_gpa(mapping, read, 0x7000_1020, fetch), None);
+
+        // A write intercept vouches for reads and writes of that page.
+        assert_eq!(
+            cached_gpa(mapping, write, 0x7000_1020, HV_TRANSLATE_GVA_VALIDATE_READ),
+            Some(0xd000_0020)
+        );
+        assert_eq!(
+            cached_gpa(mapping, write, 0x7000_1020, HV_TRANSLATE_GVA_VALIDATE_WRITE),
+            Some(0xd000_0020)
+        );
+
+        // Other pages, other intercept types and missing mappings are never cached.
+        assert_eq!(
+            cached_gpa(mapping, write, 0x7000_2000, HV_TRANSLATE_GVA_VALIDATE_READ),
+            None
+        );
+        assert_eq!(
+            cached_gpa(
+                mapping,
+                intercept_translate_flags(HV_INTERCEPT_ACCESS_EXECUTE as u8),
+                0x7000_1020,
+                HV_TRANSLATE_GVA_VALIDATE_READ
+            ),
+            None
+        );
+        assert_eq!(
+            cached_gpa(None, write, 0x7000_1020, HV_TRANSLATE_GVA_VALIDATE_READ),
+            None
+        );
     }
 }

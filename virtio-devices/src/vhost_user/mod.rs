@@ -75,6 +75,10 @@ pub enum Error {
     VhostUserGetQueueMaxNum(#[source] VhostError),
     #[error("Get protocol features failed")]
     VhostUserGetProtocolFeatures(#[source] VhostError),
+    #[error("Backend does not support protocol features {0:#x}")]
+    UnsupportedProtocolFeatures(u64),
+    #[error("Protocol features {0:#x} saved without PROTOCOL_FEATURES acknowledged")]
+    InconsistentProtocolFeatures(u64),
     #[error("Get vring base failed")]
     VhostUserGetVringBase(#[source] VhostError),
     #[error("Set owner failed")]
@@ -144,7 +148,7 @@ pub enum Error {
     #[error("Failed saving/restoring backend state")]
     SaveRestoreBackendState(#[source] io::Error),
     #[error("Vring bases count ({0}) does not match queue count ({1})")]
-    VringBasesCountMismatch(usize, usize),
+    VringBasesCountMismatch(usize, u16),
     #[error("Backend state and vring bases must both be present or both be absent")]
     InconsistentBackendState,
     #[error("Failed to create timerfd")]
@@ -315,10 +319,12 @@ impl<S: VhostUserFrontendReqHandler> VhostUserEpollHandler<S> {
             .map(|(i, q, e)| (*i, vm_virtio::clone_queue(q), e.try_clone().unwrap()))
             .collect::<Vec<_>>();
 
+        let num_queues = u16::try_from(self.queues.len())
+            .map_err(|_| EpollHelperError::IoError(io::Error::other(Error::BadQueueNum)))?;
         let mut vhost_user = match VhostUserHandle::connect_vhost_user(
             self.server,
             &self.socket_path,
-            self.queues.len() as u64,
+            num_queues,
             true,
             &self.kill_evt,
             |vhost_user| {
@@ -438,7 +444,7 @@ pub struct VhostUserState<C> {
     pub acked_features: u64,
     pub config: C,
     pub acked_protocol_features: u64,
-    pub vu_num_queues: usize,
+    pub vu_num_queues: u16,
     #[serde(default)]
     pub vring_bases: Option<Vec<u64>>,
     #[serde(default)]
@@ -461,7 +467,7 @@ pub struct VhostUserCommon {
     pub guest_memory: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
     pub acked_protocol_features: u64,
     pub socket_path: String,
-    pub vu_num_queues: usize,
+    pub vu_num_queues: u16,
     pub migration_started: bool,
     pub server: bool,
     pub vring_bases: Option<Vec<u64>>,
@@ -665,6 +671,7 @@ impl VhostUserCommon {
                 "Skipping add memory region on disconnected dev with socket: {}",
                 self.socket_path
             );
+            return Ok(());
         }
 
         if let Err(e) = self.add_memory_region_internal(region) {
@@ -736,7 +743,7 @@ impl VhostUserCommon {
         // Always run the interrupt loop so workers don't get stuck.
         for i in 0..self.vu_num_queues {
             self.virtio_common
-                .trigger_interrupt(crate::VirtioInterruptType::Queue(i as u16))
+                .trigger_interrupt(crate::VirtioInterruptType::Queue(i))
                 .ok();
         }
 
@@ -880,18 +887,61 @@ mod tests {
     use std::thread;
 
     use vhost::vhost_user::message::{FrontendReq, VhostUserHeaderFlag};
+    use vm_memory::{FileOffset, GuestAddress};
+    use vm_migration::Snapshottable;
     use vmm_sys_util::tempdir::TempDir;
 
     use super::*;
+    use crate::vsock::tests::NoopVirtioInterrupt;
+    use crate::{MmapRegion, VIRTIO_F_ACCESS_PLATFORM, VirtioDevice};
 
-    fn read_request(stream: &mut UnixStream, expected_request: FrontendReq) {
+    fn read_request(stream: &mut UnixStream, expected_request: FrontendReq) -> Vec<u8> {
         let mut header = [0u8; 12];
         stream.read_exact(&mut header).unwrap();
         assert_eq!(
             u32::from_ne_bytes(header[0..4].try_into().unwrap()),
             u32::from(expected_request)
         );
-        assert_eq!(u32::from_ne_bytes(header[8..12].try_into().unwrap()), 0);
+        let size = u32::from_ne_bytes(header[8..12].try_into().unwrap()) as usize;
+        let mut payload = vec![0; size];
+        stream.read_exact(&mut payload).unwrap();
+        payload
+    }
+
+    fn write_reply(stream: &mut UnixStream, request: FrontendReq, value: u64) {
+        let mut reply = Vec::with_capacity(20);
+        reply.extend_from_slice(&u32::from(request).to_ne_bytes());
+        reply.extend_from_slice(&(VhostUserHeaderFlag::REPLY.bits() | 1).to_ne_bytes());
+        reply.extend_from_slice(&8u32.to_ne_bytes());
+        reply.extend_from_slice(&value.to_ne_bytes());
+        stream.write_all(&reply).unwrap();
+    }
+
+    // Connects a handle to a fake backend that offers the given features.
+    fn connect_handle(features: u64) -> (VhostUserHandle, UnixStream) {
+        let temp_dir = TempDir::new_with_prefix("/tmp/vhost-user-handle-").unwrap();
+        let socket_path = temp_dir.as_path().join("backend.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let backend = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            assert!(read_request(&mut stream, FrontendReq::SET_OWNER).is_empty());
+            assert!(read_request(&mut stream, FrontendReq::GET_FEATURES).is_empty());
+            write_reply(&mut stream, FrontendReq::GET_FEATURES, features);
+            stream
+        });
+
+        let kill_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        let vu = VhostUserHandle::connect_vhost_user(
+            false,
+            socket_path.to_str().unwrap(),
+            1,
+            false,
+            &kill_evt,
+            |_| Ok(()),
+        )
+        .unwrap();
+
+        (vu, backend.join().unwrap())
     }
 
     #[test]
@@ -901,13 +951,13 @@ mod tests {
         let listener = UnixListener::bind(&socket_path).unwrap();
         let backend = thread::spawn(move || {
             let (mut first, _) = listener.accept().unwrap();
-            read_request(&mut first, FrontendReq::SET_OWNER);
-            read_request(&mut first, FrontendReq::GET_FEATURES);
+            assert!(read_request(&mut first, FrontendReq::SET_OWNER).is_empty());
+            assert!(read_request(&mut first, FrontendReq::GET_FEATURES).is_empty());
             drop(first);
 
             let (mut second, _) = listener.accept().unwrap();
-            read_request(&mut second, FrontendReq::SET_OWNER);
-            read_request(&mut second, FrontendReq::GET_FEATURES);
+            assert!(read_request(&mut second, FrontendReq::SET_OWNER).is_empty());
+            assert!(read_request(&mut second, FrontendReq::GET_FEATURES).is_empty());
 
             let mut reply = Vec::with_capacity(20);
             reply.extend_from_slice(&u32::from(FrontendReq::GET_FEATURES).to_ne_bytes());
@@ -929,5 +979,235 @@ mod tests {
         .unwrap();
 
         backend.join().unwrap();
+    }
+
+    #[test]
+    fn access_platform_is_preserved_in_guest_features() {
+        let access_platform = 1u64 << VIRTIO_F_ACCESS_PLATFORM;
+        for enabled in [false, true] {
+            for backend_features in [0, access_platform] {
+                let temp_dir = TempDir::new_with_prefix("/tmp/vhost-user-features-").unwrap();
+                let socket_path = temp_dir.as_path().join("backend.sock");
+                let listener = UnixListener::bind(&socket_path).unwrap();
+                let backend = thread::spawn(move || {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    assert!(read_request(&mut stream, FrontendReq::SET_OWNER).is_empty());
+                    assert!(read_request(&mut stream, FrontendReq::GET_FEATURES).is_empty());
+                    for value in [
+                        u32::from(FrontendReq::GET_FEATURES),
+                        VhostUserHeaderFlag::REPLY.bits() | 1,
+                        8,
+                    ] {
+                        stream.write_all(&value.to_ne_bytes()).unwrap();
+                    }
+                    stream.write_all(&backend_features.to_ne_bytes()).unwrap();
+                });
+
+                let mut device = GenericVhostUser::new(
+                    "test".to_string(),
+                    socket_path.to_str().unwrap(),
+                    vec![256],
+                    vm_virtio::VirtioDeviceType::Fs as u32,
+                    None,
+                    SeccompAction::Allow,
+                    EventFd::new(libc::EFD_NONBLOCK).unwrap(),
+                    enabled,
+                    None,
+                )
+                .unwrap();
+                assert_eq!(device.features() & access_platform != 0, enabled);
+                device.ack_features(access_platform);
+                let state: VhostUserState<()> = device.snapshot().unwrap().to_state().unwrap();
+                assert_eq!(state.avail_features, device.features());
+                assert_eq!(state.acked_features & access_platform != 0, enabled);
+                backend.join().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn access_platform_is_not_sent_to_backend() {
+        let temp_dir = TempDir::new_with_prefix("/tmp/vhost-user-features-").unwrap();
+        let socket_path = temp_dir.as_path().join("backend.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let backend = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            assert!(read_request(&mut stream, FrontendReq::SET_OWNER).is_empty());
+            assert!(read_request(&mut stream, FrontendReq::GET_FEATURES).is_empty());
+            for value in [
+                u32::from(FrontendReq::GET_FEATURES),
+                VhostUserHeaderFlag::REPLY.bits() | 1,
+                8,
+            ] {
+                stream.write_all(&value.to_ne_bytes()).unwrap();
+            }
+            let features = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_F_ACCESS_PLATFORM);
+            stream.write_all(&features.to_ne_bytes()).unwrap();
+            assert_eq!(
+                read_request(&mut stream, FrontendReq::SET_FEATURES),
+                (1u64 << VIRTIO_F_VERSION_1).to_ne_bytes()
+            );
+            assert_eq!(
+                read_request(&mut stream, FrontendReq::SET_MEM_TABLE).len(),
+                40
+            );
+        });
+
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(temp_dir.as_path().join("memory"))
+            .unwrap();
+        file.set_len(0x1000).unwrap();
+        let mem = GuestMemoryMmap::from_ranges_with_files(&[(
+            GuestAddress(0),
+            0x1000,
+            Some(FileOffset::new(file, 0)),
+        )])
+        .unwrap();
+        let kill_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        let mut vu = VhostUserHandle::connect_vhost_user(
+            false,
+            socket_path.to_str().unwrap(),
+            1,
+            false,
+            &kill_evt,
+            |_| Ok(()),
+        )
+        .unwrap();
+        struct BackendReqHandler;
+        impl VhostUserFrontendReqHandler for BackendReqHandler {}
+        vu.setup_vhost_user::<BackendReqHandler>(
+            &mem,
+            &[],
+            &NoopVirtioInterrupt {},
+            (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_F_ACCESS_PLATFORM),
+            &None,
+            None,
+            None,
+        )
+        .unwrap();
+        backend.join().unwrap();
+    }
+
+    #[test]
+    fn restored_protocol_features_must_be_supported() {
+        let protocol_features = VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits();
+        let mq = VhostUserProtocolFeatures::MQ.bits();
+        let config = VhostUserProtocolFeatures::CONFIG.bits();
+        for (saved, available) in [(mq, mq | config), (mq, config), (1u64 << 63, mq)] {
+            let missing = saved & !available;
+            let temp_dir = TempDir::new_with_prefix("/tmp/vhost-user-protocol-").unwrap();
+            let socket_path = temp_dir.as_path().join("backend.sock");
+            let listener = UnixListener::bind(&socket_path).unwrap();
+            let backend = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                assert!(read_request(&mut stream, FrontendReq::SET_OWNER).is_empty());
+                for (request, value) in [
+                    (FrontendReq::GET_FEATURES, protocol_features),
+                    (FrontendReq::GET_PROTOCOL_FEATURES, available),
+                ] {
+                    assert!(read_request(&mut stream, request).is_empty());
+                    for field in [u32::from(request), VhostUserHeaderFlag::REPLY.bits() | 1, 8] {
+                        stream.write_all(&field.to_ne_bytes()).unwrap();
+                    }
+                    stream.write_all(&value.to_ne_bytes()).unwrap();
+                }
+                if missing == 0 {
+                    assert_eq!(
+                        read_request(&mut stream, FrontendReq::SET_PROTOCOL_FEATURES),
+                        saved.to_ne_bytes()
+                    );
+                }
+                // An incompatible connection must close before sending any
+                // protocol settings, device state, or memory addresses.
+                assert_eq!(stream.read(&mut [0u8; 1]).unwrap(), 0);
+            });
+
+            let kill_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+            let result = VhostUserHandle::connect_vhost_user(
+                false,
+                socket_path.to_str().unwrap(),
+                1,
+                false,
+                &kill_evt,
+                |vu| vu.set_protocol_features_vhost_user(protocol_features, saved),
+            );
+            match result {
+                Ok(vu) => {
+                    assert_eq!(missing, 0);
+                    drop(vu);
+                }
+                Err(Error::UnsupportedProtocolFeatures(bits)) => {
+                    assert_ne!(missing, 0);
+                    assert_eq!(bits, missing);
+                }
+                Err(err) => panic!("Unexpected negotiation error: {err}"),
+            }
+            backend.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn restored_protocol_features_require_protocol_features_bit() {
+        for saved in [0, VhostUserProtocolFeatures::MQ.bits()] {
+            let temp_dir = TempDir::new_with_prefix("/tmp/vhost-user-protocol-").unwrap();
+            let socket_path = temp_dir.as_path().join("backend.sock");
+            let listener = UnixListener::bind(&socket_path).unwrap();
+            let backend = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                assert!(read_request(&mut stream, FrontendReq::SET_OWNER).is_empty());
+                assert!(read_request(&mut stream, FrontendReq::GET_FEATURES).is_empty());
+                for field in [
+                    u32::from(FrontendReq::GET_FEATURES),
+                    VhostUserHeaderFlag::REPLY.bits() | 1,
+                    8,
+                ] {
+                    stream.write_all(&field.to_ne_bytes()).unwrap();
+                }
+                stream.write_all(&0u64.to_ne_bytes()).unwrap();
+                // Protocol negotiation must not occur without PROTOCOL_FEATURES.
+                assert_eq!(stream.read(&mut [0u8; 1]).unwrap(), 0);
+            });
+
+            let kill_evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+            let result = VhostUserHandle::connect_vhost_user(
+                false,
+                socket_path.to_str().unwrap(),
+                1,
+                false,
+                &kill_evt,
+                |vu| vu.set_protocol_features_vhost_user(0, saved),
+            );
+            match result {
+                Ok(vu) => {
+                    assert_eq!(saved, 0);
+                    drop(vu);
+                }
+                Err(Error::InconsistentProtocolFeatures(bits)) => {
+                    assert_ne!(saved, 0);
+                    assert_eq!(bits, saved);
+                }
+                Err(err) => panic!("Unexpected negotiation error: {err}"),
+            }
+            backend.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn add_memory_region_skips_disconnected_device() {
+        let (vu, _backend) = connect_handle(0);
+        let mut common = VhostUserCommon {
+            vu: Some(Arc::new(Mutex::new(vu))),
+            acked_protocol_features: VhostUserProtocolFeatures::CONFIGURE_MEM_SLOTS.bits(),
+            ..Default::default()
+        };
+        common.disconnected.store(true, Ordering::Relaxed);
+
+        // Sending this region would fail, as it has no backing file.
+        let region = MmapRegion::new(0x1000).unwrap();
+        let region = Arc::new(GuestRegionMmap::new(region, GuestAddress(0)).unwrap());
+        common.add_memory_region(&region).unwrap();
     }
 }

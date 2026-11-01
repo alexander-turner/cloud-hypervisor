@@ -20,11 +20,14 @@ struct CpusConfig {
     features: CpuFeatures,
     nested: bool,
     core_scheduling: CoreScheduling,
+    profile: CpuProfileConfig,
+    // x86-64 only.
+    cpuid_overrides: Vec<CpuidOverride>,
 }
 ```
 
 ```
---cpus boot=<boot_vcpus>,max=<max_vcpus>,topology=<threads_per_core>:<cores_per_die>:<dies_per_package>:<packages>,kvm_hyperv=on|off,max_phys_bits=<maximum_number_of_physical_bits>,affinity=<list_of_vcpus_with_their_associated_cpuset>,features=<list_of_features_to_enable>,nested=on|off,core_scheduling=vm|vcpu|off
+--cpus boot=<boot_vcpus>,max=<max_vcpus>,topology=<threads_per_core>:<cores_per_die>:<dies_per_package>:<packages>,kvm_hyperv=on|off,max_phys_bits=<maximum_number_of_physical_bits>,affinity=<list_of_vcpus_with_their_associated_cpuset>,features=<list_of_features_to_enable>,nested=on|off,core_scheduling=vm|vcpu|off,profile=host|path:<file>,x-cpuid-overrides=[[<leaf>,<subleaf>,<eax>,<ebx>,<ecx>,<edx>],...]
 ```
 
 ### `boot`
@@ -215,13 +218,22 @@ In this example the amx CPU feature will be enabled for the VMM.
 
 ### `nested`
 
-Enable nested virtualization (default off). Nested virtualization is needed to access hardware virtualization by this guest. This option can only be changed on x86-64.
+Enable nested virtualization (default off). Nested virtualization is needed to
+access hardware virtualization from a guest. This option is available on x86_64
+(KVM & MSHV) and aarch64 (KVM only).
 
 _Example_
 
 ```
 --cpus nested=on
 ```
+
+#### KVM aarch64 host requirements
+
+On `aarch64`, nested virtualization is supported if the kernel has `KVM_CAP_ARM_EL2`.
+This can be enabled on the kernel command line by specifying `kvm-arm.mode=nested`.
+Nested virtualization is supported only on hardware with `FEAT_NV2` and a host
+kernel in VHE mode.
 
 ### `core_scheduling`
 
@@ -253,3 +265,109 @@ _Example_
 In this example, both vCPUs will share the same core scheduling cookie,
 allowing them to be co-scheduled on SMT siblings while preventing host
 threads from sharing those siblings.
+
+### `profile`
+
+CPU profiles are experimental. They are under active development and no
+guarantees are made about their stability.
+
+Select the CPU profile used to configure guest CPUID and MSRs. `host` is the
+default. A file profile describes the CPU capabilities required by the guest,
+which are checked against the host when creating or restoring the VM.
+
+File profiles are supported on x86-64 with KVM. Other architectures and MSHV
+support `host` only.
+
+CLI selectors are case-insensitive; the file path retains its original case.
+
+Load a profile with:
+
+```shell
+--cpus boot=2,profile=path:/path/to/cpu_profile.json
+```
+
+Paths may be absolute or relative to the current working directory. Quote the
+value when a path contains commas or brackets:
+
+```shell
+--cpus 'boot=2,profile="path:/path/to/cpu,profile.json"'
+```
+
+The configuration contains only the profile path. The file is read whenever
+the VM's CPUs are created, including reboot, snapshot restore, and migration
+at the destination. Keep the file available and unchanged across these
+operations. For restore or migration on another host, provide the same
+contents at the configured path there.
+
+The JSON file has two required sections:
+
+- `cpuid.adjustments` contains `[parameters, adjustment]` pairs. Parameters
+  specify `leaf`, an inclusive `sub_leaf` range with `start` and `end`, and a
+  `register` (`EAX`, `EBX`, `ECX`, or `EDX`). Each adjustment has `mask` and
+  `replacements` fields. Registers without an adjustment are cleared.
+- `msr.adjustments` contains `[address, adjustment]` pairs for feature MSRs.
+  `msr.required_msrs` lists the MSR addresses required by the profile.
+
+Both adjustment types compute `(host_value & mask) | replacements`. Leaves,
+sub-leaves, MSR addresses, masks and replacement values are hexadecimal strings
+with a `0x` prefix. CPUID values and MSR addresses are 32-bit; MSR values are
+64-bit. Normal VM settings, including topology, AMX, Hyper-V and nested
+virtualization, still apply.
+
+The JSON API accepts `"Host"` or an object with a `"File"` key whose value is
+the profile path, such as `{"File": "/path/to/cpu_profile.json"}`. See the
+`CpuProfileConfig` schema in
+[the OpenAPI definition](../vmm/src/api/openapi/cloud-hypervisor.yaml).
+
+### `x-cpuid-overrides` (experimental, x86-64 only)
+
+This option is experimental and may change between releases.
+
+Replace the register values returned by selected CPUID leaves and subleaves.
+This can be used to adjust the CPU information exposed to a guest when
+preparing for snapshot/restore or migration between different hosts.
+
+Each entry contains six unsigned 32-bit values in this order:
+`leaf,subleaf,eax,ebx,ecx,edx`. All values must use `0x`-prefixed hexadecimal
+notation. An entry replaces all four registers of every matching leaf and
+subleaf, or adds a new entry if none exists. Entries are applied in order, so
+the last override for a given leaf and subleaf wins. By default the list is
+empty.
+
+_Example_
+
+```
+--cpus 'boot=2,x-cpuid-overrides=[[0x80000002,0x0,0x0,0x0,0x0,0x0]]'
+```
+
+The corresponding JSON CPU configuration is:
+
+```json
+{
+  "boot_vcpus": 2,
+  "max_vcpus": 2,
+  "x-cpuid-overrides": [
+    {
+      "leaf": "0x80000002",
+      "subleaf": "0x0",
+      "eax": "0x0",
+      "ebx": "0x0",
+      "ecx": "0x0",
+      "edx": "0x0"
+    }
+  ]
+}
+```
+
+Overrides are applied to the common CPUID after the selected CPU profile
+and Cloud Hypervisor's normal adjustments. Per-vCPU adjustments, including
+APIC IDs and CPU topology, are applied afterwards and may change overridden
+values. Snapshot and migration compatibility checks use the overridden
+common CPUID.
+
+Overrides can be used with any CPU profile.
+Cloud Hypervisor does not validate overridden values against host CPU
+capabilities or update related CPUID leaves or MSRs. The caller must ensure
+that the resulting CPU description is consistent and supported by every
+host on which the VM will run. Overrides alone do not guarantee snapshot
+or migration compatibility.

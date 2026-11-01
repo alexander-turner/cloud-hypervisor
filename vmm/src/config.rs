@@ -6,15 +6,20 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 #[cfg(feature = "ivshmem")]
 use std::fs;
+use std::os::fd::RawFd;
 use std::path::PathBuf;
-use std::result;
 use std::str::FromStr;
 use std::sync::LazyLock;
+use std::{io, result};
 
-use arch::CpuProfile;
+use arch::CpuProfileConfig;
+#[cfg(target_arch = "x86_64")]
+use arch::CpuidOverride;
 use block::ImageType;
 use clap::ArgMatches;
 use log::{debug, warn};
+#[cfg(target_arch = "x86_64")]
+use option_parser::split_commas;
 use option_parser::{
     ByteSized, IntegerList, OptionParser, OptionParserError, StringList, Toggle, Tuple, TupleList,
 };
@@ -38,7 +43,9 @@ const VIRTIO_MAX_QUEUE_SIZE: u16 = 32768;
 
 #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
 const MAX_SUPPORTED_CPUS: u32 = 8192;
-#[cfg(not(all(feature = "kvm", target_arch = "x86_64")))]
+#[cfg(all(feature = "kvm", target_arch = "aarch64"))]
+const MAX_SUPPORTED_CPUS: u32 = 4096;
+#[cfg(not(all(feature = "kvm", any(target_arch = "x86_64", target_arch = "aarch64"))))]
 const MAX_SUPPORTED_CPUS: u32 = 255;
 
 /// Errors associated with VM configuration parameters.
@@ -87,6 +94,8 @@ pub enum Error {
     /// Error parsing CPU options
     #[error("Error parsing --cpus")]
     ParseCpus(#[source] OptionParserError),
+    #[error("Error parsing --cpus profile")]
+    ParseCpuProfile(#[source] arch::ParseCpuProfileError),
     /// Invalid CPU features
     #[error("Invalid feature in --cpus features list: {0}")]
     InvalidCpuFeatures(String),
@@ -132,6 +141,12 @@ pub enum Error {
     /// Failed parsing serial parameters
     #[error("Error parsing --serial")]
     ParseSerial(#[source] OptionParserError),
+    #[error("Cannot resolve TCP console address {address:?}")]
+    ResolveConsoleTcpAddress {
+        address: String,
+        #[source]
+        source: io::Error,
+    },
     /// No mode given for console
     #[error("Error parsing --console: invalid console mode given")]
     ParseConsoleInvalidModeGiven,
@@ -194,6 +209,9 @@ pub enum Error {
     ParseFwCfgItem(#[source] OptionParserError),
     #[error("Error parsing common PCI device config")]
     ParsePciDeviceCommonConfig(#[source] OptionParserError),
+    #[cfg(target_arch = "x86_64")]
+    #[error("Error parsing CPUID overrides")]
+    InvalidCpuidOverride(#[source] CpuidOverrideParseError),
 }
 
 #[derive(Debug, PartialEq, Eq, Error)]
@@ -207,12 +225,28 @@ pub enum ValidationError {
     /// Socket path given without socket console mode
     #[error("Path only valid when using socket console mode")]
     ConsoleSocketPathUnexpected,
+    /// Missing address for TCP console mode
+    #[error("Address missing when using TCP console mode")]
+    ConsoleTcpAddressMissing,
+    /// TCP address given without TCP console mode
+    #[error("Address only valid when using TCP console mode")]
+    ConsoleTcpUnexpected,
+    #[error("Server is only valid when using TCP console mode")]
+    ConsoleTcpServerUnexpected,
+    #[error("TCP console client mode is not supported")]
+    ConsoleTcpClientUnsupported,
+    #[error("TCP console port must not be zero")]
+    ConsoleTcpPortZero,
     /// Max is less than boot
     #[error("Max CPUs ({0}) lower than boot CPUs ({1})")]
     CpusMaxLowerThanBoot(u32 /* max vCPUs */, u32 /* boot vCPUs */),
     /// Too many CPUs.
     #[error("Too many CPUs: specified {0} but {MAX_SUPPORTED_CPUS} is the limit")]
     TooManyCpus(u32 /* specified CPUs */),
+    #[cfg(target_arch = "aarch64")]
+    /// The GICv3 layout does not fit this many CPUs.
+    #[error("Too many CPUs for the GICv3 layout: specified {0} but {1} is the limit")]
+    TooManyCpusForGic(u32 /* specified CPUs */, u64 /* limit */),
     /// Requested CPU affinity matches or exceeds the size the libc accepts.
     #[error("Requested CPU affinity {0} must be below {1}")]
     CpuAffinityExceedsMax(
@@ -246,16 +280,16 @@ pub enum ValidationError {
     CpuTopologyDiesPerPackage,
     /// Virtio needs a min of 2 queues
     #[error("Number of queues ({0}) to virtio_net should be higher than 2")]
-    VnetQueueLowerThan2(usize),
+    VnetQueueLowerThan2(u16),
     /// Virtio-net queues come in RX/TX pairs
     #[error("Number of queues ({0}) to virtio_net must be even")]
-    VnetQueueOdd(usize),
+    VnetQueueOdd(u16),
     /// The input queue number for virtio_net must match the number of input fds
     #[error("Number of queues ({0}) to virtio_net does not match the number of FDs ({1})")]
-    VnetQueueFdMismatch(usize /* num of queues */, usize /* FD num */),
+    VnetQueueFdMismatch(u16 /* num of queues */, usize /* FD num */),
     /// Using reserved fd
     #[error("Reserved fd number (<= 2): {0}")]
-    VnetReservedFd(i32),
+    VnetReservedFd(RawFd),
     /// Hardware checksum offload is disabled.
     #[error("\"offload_tso\" and \"offload_ufo\" depend on \"offload_csum\"")]
     NoHardwareChecksumOffload,
@@ -265,17 +299,9 @@ pub enum ValidationError {
     /// Huge page size is not power of 2
     #[error("Huge page size is not power of 2: {0}")]
     InvalidHugePageSize(u64),
-    /// CPU Hotplug is not permitted with TDX
-    #[cfg(feature = "tdx")]
-    #[error("CPU hotplug is not permitted with TDX")]
-    TdxNoCpuHotplug,
-    /// Missing firmware for TDX
-    #[cfg(feature = "tdx")]
-    #[error("No TDX firmware specified")]
-    TdxFirmwareMissing,
     /// Insufficient vCPUs for queues
     #[error("Queue count ({0}) must not exceed boot vCPUs ({1})")]
-    TooManyQueues(usize /* queues */, usize /* vCPUs */),
+    TooManyQueues(u16 /* queues */, usize /* vCPUs */),
     /// Queue size is not a power of 2 within the spec-permitted range
     #[error("Queue size must be a power of 2 no greater than {VIRTIO_MAX_QUEUE_SIZE}: {0}")]
     InvalidQueueSize(u16),
@@ -284,7 +310,7 @@ pub enum ValidationError {
     BlockQueueSizeTooSmall(u16),
     /// Disk queue affinity refers to a queue the disk does not have
     #[error("Queue affinity refers to queue {0}, but the disk has {1} queues")]
-    InvalidQueueAffinity(u16 /* queue index */, usize /* queues */),
+    InvalidQueueAffinity(u16 /* queue index */, u16 /* queues */),
     /// Disk guest_block_size is not a power of 2 within the supported range
     #[error("Disk guest_block_size must be a power of 2 between 512 and 65536: {0}")]
     InvalidGuestBlockSize(u32),
@@ -388,13 +414,16 @@ pub enum ValidationError {
     #[cfg(feature = "sev_snp")]
     #[error("SEV-SNP requires an IGVM payload (--payload igvm=<path>)")]
     SevSnpRequiresIgvm,
+    #[cfg(all(feature = "kvm", feature = "sev_snp"))]
+    #[error("SEV-SNP on KVM requires ACPI tables supplied through fw_cfg")]
+    SevSnpRequiresFwCfgAcpi,
     /// Memory hotplug is not supported with SEV-SNP
     #[cfg(feature = "sev_snp")]
     #[error("Memory hotplug is not supported with SEV-SNP")]
     SevSnpNoMemoryHotplug,
-    /// CPU hotplug is not supported with SEV-SNP
+    /// CPU hotplug is not supported with SEV-SNP on MSHV
     #[cfg(feature = "sev_snp")]
-    #[error("CPU hotplug is not supported with SEV-SNP")]
+    #[error("CPU hotplug is not supported with SEV-SNP on MSHV")]
     SevSnpNoCpuHotplug,
     /// Huge pages are not supported with SEV-SNP
     #[cfg(feature = "sev_snp")]
@@ -476,9 +505,23 @@ pub enum ValidationError {
     /// More than one update was specified that contains an empty memory zone ID
     #[error("At least one memory zone update with an empty ID was defined")]
     MemoryZoneUpdatesEmptyId,
+    /// A memory size of 0 requires memory zones
+    #[error("Memory zones are required when the memory size is 0")]
+    MemoryZonesMissing,
 }
 
 type ValidationResult<T> = result::Result<T, ValidationError>;
+
+#[cfg(target_arch = "aarch64")]
+fn validate_gic_layout(max_vcpus: u32) -> ValidationResult<()> {
+    if u64::from(max_vcpus) > arch::layout::GIC_V3_LAYOUT_MAX_VCPUS {
+        return Err(ValidationError::TooManyCpusForGic(
+            max_vcpus,
+            arch::layout::GIC_V3_LAYOUT_MAX_VCPUS,
+        ));
+    }
+    Ok(())
+}
 
 pub fn add_to_config<T>(items: &mut Option<Vec<T>>, item: T) {
     if let Some(items) = items {
@@ -752,6 +795,86 @@ impl FromStr for CpuTopology {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct CpuidOverrides(Vec<CpuidOverride>);
+
+#[cfg(target_arch = "x86_64")]
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum CpuidOverrideParseError {
+    #[error("Expected a bracketed list '[...]', got {0:?}")]
+    MissingBrackets(String),
+    #[error("Expected a bracketed entry '[leaf,subleaf,eax,ebx,ecx,edx]', got {0:?}")]
+    MalformedEntry(String),
+    #[error(
+        "Expected 6 comma-separated fields (leaf,subleaf,eax,ebx,ecx,edx), got {count} in {entry:?}"
+    )]
+    FieldCount { count: usize, entry: String },
+    #[error("Invalid 32-bit value {0:?} (use 0x-prefixed hex)")]
+    InvalidValue(String),
+}
+
+#[cfg(target_arch = "x86_64")]
+impl FromStr for CpuidOverrides {
+    type Err = CpuidOverrideParseError;
+
+    fn from_str(s: &str) -> result::Result<Self, Self::Err> {
+        let body = s
+            .trim()
+            .strip_prefix('[')
+            .and_then(|inner| inner.strip_suffix(']'))
+            .ok_or_else(|| CpuidOverrideParseError::MissingBrackets(s.to_owned()))?
+            .trim();
+
+        if body.is_empty() {
+            return Ok(CpuidOverrides(Vec::new()));
+        }
+
+        let overrides = split_commas(body)
+            .map_err(|_| CpuidOverrideParseError::MalformedEntry(body.to_owned()))?
+            .iter()
+            .map(|entry| parse_cpuid_override_entry(entry.trim()))
+            .collect::<result::Result<Vec<_>, _>>()?;
+
+        Ok(CpuidOverrides(overrides))
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn parse_cpuid_override_entry(
+    entry: &str,
+) -> result::Result<CpuidOverride, CpuidOverrideParseError> {
+    let values = entry
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .ok_or_else(|| CpuidOverrideParseError::MalformedEntry(entry.to_owned()))?
+        .split(',')
+        .map(|field| {
+            let field = field.trim();
+            field
+                .strip_prefix("0x")
+                .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+                .ok_or_else(|| CpuidOverrideParseError::InvalidValue(field.to_owned()))
+        })
+        .collect::<result::Result<Vec<_>, _>>()?;
+
+    let [leaf, subleaf, eax, ebx, ecx, edx] = values[..] else {
+        return Err(CpuidOverrideParseError::FieldCount {
+            count: values.len(),
+            entry: entry.to_owned(),
+        });
+    };
+
+    Ok(CpuidOverride {
+        leaf,
+        subleaf,
+        eax,
+        ebx,
+        ecx,
+        edx,
+    })
+}
+
 impl CpusConfig {
     pub fn parse(cpus: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
@@ -766,6 +889,8 @@ impl CpusConfig {
             .add("nested")
             .add("core_scheduling")
             .add("profile");
+        #[cfg(target_arch = "x86_64")]
+        parser.add("x-cpuid-overrides");
         parser.parse(cpus).map_err(Error::ParseCpus)?;
 
         let boot_vcpus: u32 = parser
@@ -799,8 +924,19 @@ impl CpusConfig {
             });
 
         let profile = parser
-            .convert::<CpuProfile>("profile")
-            .map_err(Error::ParseCpus)?
+            .get("profile")
+            .map(|profile| profile.parse::<CpuProfileConfig>())
+            .transpose()
+            .map_err(Error::ParseCpuProfile)?
+            .unwrap_or_default();
+
+        #[cfg(target_arch = "x86_64")]
+        let cpuid_overrides = parser
+            .get("x-cpuid-overrides")
+            .map(|value| value.parse::<CpuidOverrides>())
+            .transpose()
+            .map_err(Error::InvalidCpuidOverride)?
+            .map(|overrides| overrides.0)
             .unwrap_or_default();
 
         let features_list = parser
@@ -846,6 +982,8 @@ impl CpusConfig {
             nested,
             core_scheduling,
             profile,
+            #[cfg(target_arch = "x86_64")]
+            cpuid_overrides,
         })
     }
 }
@@ -921,10 +1059,6 @@ impl PlatformConfig {
             oem_strings=<list_of_strings>,chassis_asset_tag=<dmi_chassis_asset_tag>"
                 .to_string();
 
-            if cfg!(feature = "tdx") {
-                syntax.push_str(",tdx=on|off");
-            }
-
             if cfg!(feature = "sev_snp") {
                 syntax.push_str(",sev_snp=on|off");
             }
@@ -983,8 +1117,6 @@ impl PlatformConfig {
             .add("num_pci_segments")
             .add("iommu_segments")
             .add("iommu_address_width")
-            .add("serial_number")
-            .add("uuid")
             .add("oem_strings")
             .add("iommufd")
             .add("iommufd_fd")
@@ -992,8 +1124,6 @@ impl PlatformConfig {
         for field in SMBIOS_STRING_FIELDS {
             parser.add(field.key);
         }
-        #[cfg(feature = "tdx")]
-        parser.add("tdx");
         #[cfg(feature = "sev_snp")]
         parser.add("sev_snp");
         parser.parse(platform).map_err(Error::ParsePlatform)?;
@@ -1015,7 +1145,7 @@ impl PlatformConfig {
             .map_err(Error::ParsePlatform)?
             .map(|v| v.0.into_boxed_slice());
         let iommufd_fd = parser
-            .convert::<i32>("iommufd_fd")
+            .convert::<RawFd>("iommufd_fd")
             .map_err(Error::ParsePlatform)?;
         // `iommufd_fd=<n>` implies `iommufd=on` unless the user explicitly set the value.
         let iommufd = parser
@@ -1026,12 +1156,6 @@ impl PlatformConfig {
             .convert::<Toggle>("vfio_p2p_dma")
             .map_err(Error::ParsePlatform)?
             .unwrap_or(Toggle(true))
-            .0;
-        #[cfg(feature = "tdx")]
-        let tdx = parser
-            .convert::<Toggle>("tdx")
-            .map_err(Error::ParsePlatform)?
-            .unwrap_or(Toggle(false))
             .0;
         #[cfg(feature = "sev_snp")]
         let sev_snp = parser
@@ -1055,8 +1179,6 @@ impl PlatformConfig {
             chassis_asset_tag: None,
             iommufd,
             iommufd_fd,
-            #[cfg(feature = "tdx")]
-            tdx,
             #[cfg(feature = "sev_snp")]
             sev_snp,
             vfio_p2p_dma,
@@ -1070,24 +1192,6 @@ impl PlatformConfig {
                 (field.apply)(&mut platform_config, value);
             }
         }
-
-        let legacy_serial_number = parser
-            .convert::<String>("serial_number")
-            .map_err(Error::ParsePlatform)?;
-        if legacy_serial_number.is_some() {
-            warn!("'serial_number' in --platform is deprecated; use 'system_serial_number'.");
-        }
-        platform_config.system_serial_number = platform_config
-            .system_serial_number
-            .or(legacy_serial_number);
-
-        let legacy_uuid = parser
-            .convert::<String>("uuid")
-            .map_err(Error::ParsePlatform)?;
-        if legacy_uuid.is_some() {
-            warn!("'uuid' in --platform is deprecated; use 'system_uuid'.");
-        }
-        platform_config.system_uuid = platform_config.system_uuid.or(legacy_uuid);
 
         Ok(platform_config)
     }
@@ -1690,7 +1794,7 @@ impl DiskConfig {
     pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
         self.pci_common.validate(vm_config, true)?;
 
-        if self.num_queues > vm_config.cpus.boot_vcpus as usize {
+        if self.num_queues as u32 > vm_config.cpus.boot_vcpus {
             return Err(ValidationError::TooManyQueues(
                 self.num_queues,
                 vm_config.cpus.boot_vcpus as usize,
@@ -1704,9 +1808,7 @@ impl DiskConfig {
         }
 
         if let Some(affinity) = self.queue_affinity.as_ref()
-            && let Some(invalid) = affinity
-                .iter()
-                .find(|a| a.queue_index as usize >= self.num_queues)
+            && let Some(invalid) = affinity.iter().find(|a| a.queue_index >= self.num_queues)
         {
             return Err(ValidationError::InvalidQueueAffinity(
                 invalid.queue_index,
@@ -1882,7 +1984,7 @@ impl NetConfig {
         let fds = parser
             .convert::<IntegerList>("fd")
             .map_err(Error::ParseNetwork)?
-            .map(|v| v.0.iter().map(|e| *e as i32).collect());
+            .map(|v| v.0.iter().map(|e| *e as RawFd).collect());
         let bw_size = parser
             .convert("bw_size")
             .map_err(Error::ParseNetwork)?
@@ -1971,7 +2073,7 @@ impl NetConfig {
 
         if let Some(fds) = &self.fds {
             let actual_queues = fds.len() * 2;
-            if actual_queues != self.num_queues {
+            if actual_queues != self.num_queues as usize {
                 return Err(ValidationError::VnetQueueFdMismatch(
                     self.num_queues,
                     actual_queues,
@@ -1985,7 +2087,7 @@ impl NetConfig {
             }
         }
 
-        if (self.num_queues / 2) > vm_config.cpus.boot_vcpus as usize {
+        if (self.num_queues / 2) as u32 > vm_config.cpus.boot_vcpus {
             return Err(ValidationError::TooManyQueues(
                 self.num_queues,
                 vm_config.cpus.boot_vcpus as usize,
@@ -2130,8 +2232,6 @@ impl GenericVhostUserConfig {
         let mut parser = OptionParser::new();
         parser
             .add("device_type")
-            // TODO: Remove 'virtio_id' as a deprecated alias for 'device_type'
-            .add("virtio_id")
             .add("queue_sizes")
             .add("socket")
             .add_all(PciDeviceCommonConfig::OPTIONS);
@@ -2147,16 +2247,9 @@ impl GenericVhostUserConfig {
             .convert::<IntegerList<u16>>("queue_sizes")
             .map_err(Error::ParseGenericVhostUser)?
             .ok_or(Error::ParseGenericVhostUserQueueSizeMissing)?;
-        let legacy_virtio_id = parser
-            .convert::<String>("virtio_id")
-            .map_err(Error::ParseGenericVhostUser)?;
-        if legacy_virtio_id.is_some() {
-            warn!("'virtio_id' in --generic-vhost-user is deprecated; use 'device_type'.");
-        }
         let device_type_str = parser
             .convert::<String>("device_type")
             .map_err(Error::ParseGenericVhostUser)?
-            .or(legacy_virtio_id)
             .ok_or(Error::ParseGenericVhostUserVirtioIdMissing)?;
         let device_type = match device_type_str.as_bytes() {
             b"net" => VIRTIO_ID_NET,
@@ -2290,7 +2383,7 @@ impl FsConfig {
     }
 
     pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
-        if self.num_queues > vm_config.cpus.boot_vcpus as usize {
+        if self.num_queues as u32 > vm_config.cpus.boot_vcpus {
             return Err(ValidationError::TooManyQueues(
                 self.num_queues,
                 vm_config.cpus.boot_vcpus as usize,
@@ -2325,7 +2418,7 @@ impl FwCfgConfig {
         let e820 = parser
             .convert::<Toggle>("e820")
             .map_err(Error::ParseFwCfgItem)?
-            .unwrap_or(Toggle(true))
+            .unwrap_or(Toggle(cfg!(target_arch = "x86_64")))
             .0;
         let kernel = parser
             .convert::<Toggle>("kernel")
@@ -2449,17 +2542,18 @@ impl PmemConfig {
 
 impl CommonConsoleConfig {
     const VALUELESS_OPTIONS: &[&str] = &["off", "pty", "tty", "null"];
-    const VALUE_OPTIONS: &[&str] = &["file", "socket"];
+    const VALUE_OPTIONS: &[&str] = &["file", "socket", "tcp", "server"];
 
     fn parse(console: &str, map_err: impl Fn(OptionParserError) -> Error) -> Result<Self> {
         let mut parser = OptionParser::new();
         parser
             .add_all_valueless(Self::VALUELESS_OPTIONS)
             .add_all(Self::VALUE_OPTIONS);
-        parser.parse_subset(console).map_err(map_err)?;
+        parser.parse_subset(console).map_err(&map_err)?;
 
         let mut file: Option<PathBuf> = None;
         let mut socket: Option<PathBuf> = None;
+        let mut tcp: Option<TcpConsoleConfig> = None;
         let mut mode: ConsoleOutputMode = ConsoleOutputMode::Off;
 
         if parser.is_set("off") {
@@ -2480,11 +2574,42 @@ impl CommonConsoleConfig {
             socket = Some(PathBuf::from(parser.get("socket").ok_or(
                 Error::Validation(ValidationError::ConsoleSocketPathMissing),
             )?));
+        } else if parser.is_set("tcp") {
+            mode = ConsoleOutputMode::Tcp;
+            let address = parser
+                .get("tcp")
+                .ok_or(Error::Validation(ValidationError::ConsoleTcpAddressMissing))?;
+            let server = parser
+                .convert::<Toggle>("server")
+                .map_err(&map_err)?
+                .unwrap_or(Toggle(true))
+                .0;
+            if !server {
+                return Err(Error::Validation(
+                    ValidationError::ConsoleTcpClientUnsupported,
+                ));
+            }
+            tcp = Some(TcpConsoleConfig {
+                address: parse_tcp_address(&address)
+                    .map_err(|source| Error::ResolveConsoleTcpAddress { address, source })?,
+                server,
+            });
         } else {
             return Err(Error::ParseConsoleInvalidModeGiven);
         }
 
-        Ok(Self { mode, file, socket })
+        if parser.is_set("server") && mode != ConsoleOutputMode::Tcp {
+            return Err(Error::Validation(
+                ValidationError::ConsoleTcpServerUnexpected,
+            ));
+        }
+
+        Ok(Self {
+            mode,
+            file,
+            socket,
+            tcp,
+        })
     }
 
     pub fn validate(&self) -> ValidationResult<()> {
@@ -2493,6 +2618,22 @@ impl CommonConsoleConfig {
         }
         if self.socket.is_some() && self.mode != ConsoleOutputMode::Socket {
             return Err(ValidationError::ConsoleSocketPathUnexpected);
+        }
+        if self.mode == ConsoleOutputMode::Tcp && self.tcp.is_none() {
+            return Err(ValidationError::ConsoleTcpAddressMissing);
+        }
+        if self.tcp.is_some() && self.mode != ConsoleOutputMode::Tcp {
+            return Err(ValidationError::ConsoleTcpUnexpected);
+        }
+        if let Some(tcp) = &self.tcp
+            && !tcp.server
+        {
+            return Err(ValidationError::ConsoleTcpClientUnsupported);
+        }
+        if let Some(tcp) = &self.tcp
+            && tcp.address.port() == 0
+        {
+            return Err(ValidationError::ConsoleTcpPortZero);
         }
         Ok(())
     }
@@ -2610,7 +2751,7 @@ impl DeviceConfig {
 
         let pci_common = PciDeviceCommonConfig::parse(device)?;
         let path = parser.get("path").map(PathBuf::from);
-        let fd = parser.convert::<i32>("fd").map_err(Error::ParseDevice)?;
+        let fd = parser.convert::<RawFd>("fd").map_err(Error::ParseDevice)?;
         let x_nv_gpudirect_clique = parser
             .convert::<u8>("x_nv_gpudirect_clique")
             .map_err(Error::ParseDevice)?;
@@ -2906,14 +3047,14 @@ pub struct RestoredNetConfig {
     // Valid FDs are transmitted via a different channel (SCM_RIGHTS message)
     // and will be populated into this struct on the destination VMM eventually.
     #[serde(default, deserialize_with = "deserialize_restorednetconfig_fds")]
-    pub fds: Option<Vec<i32>>,
+    pub fds: Option<Vec<RawFd>>,
 }
 
-fn deserialize_restorednetconfig_fds<'de, D>(d: D) -> result::Result<Option<Vec<i32>>, D::Error>
+fn deserialize_restorednetconfig_fds<'de, D>(d: D) -> result::Result<Option<Vec<RawFd>>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let invalid_fds: Option<Vec<i32>> = Option::deserialize(d)?;
+    let invalid_fds: Option<Vec<RawFd>> = Option::deserialize(d)?;
     if let Some(invalid_fds) = invalid_fds {
         // If the live-migration path is used properly, new FDs are passed as
         // SCM_RIGHTS message. So, we don't get them from the serialized JSON
@@ -2973,14 +3114,14 @@ pub struct RestoredVfioConfig {
     pub id: String,
     // FDs are not serialized and any deserialized value is invalid; see NetConfig::fds.
     #[serde(default, deserialize_with = "deserialize_restored_fd")]
-    pub fd: Option<i32>,
+    pub fd: Option<RawFd>,
 }
 
-pub(crate) fn deserialize_restored_fd<'de, D>(d: D) -> result::Result<Option<i32>, D::Error>
+pub(crate) fn deserialize_restored_fd<'de, D>(d: D) -> result::Result<Option<RawFd>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let invalid_fd: Option<i32> = Option::deserialize(d)?;
+    let invalid_fd: Option<RawFd> = Option::deserialize(d)?;
     if invalid_fd.is_some() {
         Ok(Some(-1))
     } else {
@@ -3002,7 +3143,7 @@ pub struct RestoreConfig {
     pub vfio_fds: Option<Vec<RestoredVfioConfig>>,
     // FDs are not serialized and any deserialized value is invalid; see NetConfig::fds.
     #[serde(default, deserialize_with = "deserialize_restored_fd")]
-    pub iommufd_fd: Option<i32>,
+    pub iommufd_fd: Option<RawFd>,
     #[serde(default)]
     pub resume: bool,
     #[serde(default)]
@@ -3062,7 +3203,7 @@ impl RestoreConfig {
                     .map(|Tuple(id, fds)| RestoredNetConfig {
                         id: id.clone(),
                         num_fds: fds.len(),
-                        fds: Some(fds.iter().map(|e| *e as i32).collect()),
+                        fds: Some(fds.iter().map(|e| *e as RawFd).collect()),
                     })
                     .collect()
             });
@@ -3073,12 +3214,12 @@ impl RestoreConfig {
                 v.0.iter()
                     .map(|Tuple(id, fd)| RestoredVfioConfig {
                         id: id.clone(),
-                        fd: Some(*fd as i32),
+                        fd: Some(*fd as RawFd),
                     })
                     .collect()
             });
         let iommufd_fd = parser
-            .convert::<i32>("iommufd_fd")
+            .convert::<RawFd>("iommufd_fd")
             .map_err(Error::ParseRestore)?;
         let resume = parser
             .convert::<Toggle>("resume")
@@ -3274,7 +3415,8 @@ impl LandlockConfig {
         if !self.path.exists() {
             return Err(ValidationError::LandlockPathDoesNotExist(self.path.clone()));
         }
-        LandlockAccess::try_from(self.access.as_str())
+        self.access
+            .parse::<LandlockAccess>()
             .map_err(|e| ValidationError::InvalidLandlockAccess(e.to_string()))?;
         Ok(())
     }
@@ -3449,18 +3591,6 @@ impl VmConfig {
             ))?
             .validate()?;
 
-        #[cfg(feature = "tdx")]
-        {
-            let tdx_enabled = self.platform.as_ref().is_some_and(|p| p.tdx);
-            // At this point we know payload isn't None.
-            if tdx_enabled && self.payload.as_ref().unwrap().firmware.is_none() {
-                return Err(ValidationError::TdxFirmwareMissing);
-            }
-            if tdx_enabled && (self.cpus.max_vcpus != self.cpus.boot_vcpus) {
-                return Err(ValidationError::TdxNoCpuHotplug);
-            }
-        }
-
         #[cfg(feature = "sev_snp")]
         {
             let sev_snp_enabled = self.platform.as_ref().is_some_and(|p| p.sev_snp);
@@ -3483,10 +3613,29 @@ impl VmConfig {
                     return Err(ValidationError::SevSnpRequiresIgvm);
                 }
 
+                #[cfg(feature = "kvm")]
+                {
+                    #[cfg(feature = "fw_cfg")]
+                    let acpi_tables_supplied = self
+                        .payload
+                        .as_ref()
+                        .unwrap()
+                        .fw_cfg_config
+                        .as_ref()
+                        .is_some_and(|fw_cfg| fw_cfg.acpi_tables);
+                    #[cfg(not(feature = "fw_cfg"))]
+                    let acpi_tables_supplied = false;
+
+                    if !acpi_tables_supplied {
+                        return Err(ValidationError::SevSnpRequiresFwCfgAcpi);
+                    }
+                }
+
                 if self.memory.hotplug_size() > 0 || self.memory.hotplugged_size() > 0 {
                     return Err(ValidationError::SevSnpNoMemoryHotplug);
                 }
 
+                #[cfg(not(feature = "kvm"))]
                 if self.cpus.max_vcpus != self.cpus.boot_vcpus {
                     return Err(ValidationError::SevSnpNoCpuHotplug);
                 }
@@ -3552,9 +3701,13 @@ impl VmConfig {
             // vCPUs: self.cpus.max_vcpus was of type u8, so 255 was the maximum;
             // on x86_64, the legacy mptable/apic was limited to 254 CPUs.
             //
-            // Now the limit is lifted on x86_64 targets. Other targests/archs: TBD.
+            // Now the limit is lifted on x86_64 and aarch64 with KVM. Other
+            // targets/archs: TBD.
             return Err(ValidationError::TooManyCpus(self.cpus.max_vcpus));
         }
+
+        #[cfg(target_arch = "aarch64")]
+        validate_gic_layout(self.cpus.max_vcpus)?;
 
         if let Some(affinity) = &self.cpus.affinity {
             for affinity in affinity.iter().flat_map(|affinity| &affinity.host_cpus) {
@@ -3567,6 +3720,10 @@ impl VmConfig {
                     ));
                 }
             }
+        }
+
+        if self.memory.size == 0 && self.memory.zones.is_none() {
+            return Err(ValidationError::MemoryZonesMissing);
         }
 
         if let Some(rate_limit_groups) = &self.rate_limit_groups {
@@ -4193,7 +4350,7 @@ impl VmConfig {
     /// # Safety
     /// To use this safely, the caller must guarantee that the input
     /// fds are all valid.
-    pub unsafe fn add_preserved_fds(&mut self, fds: Vec<i32>) {
+    pub unsafe fn add_preserved_fds(&mut self, fds: Vec<RawFd>) {
         if fds.is_empty() {
             return;
         }
@@ -4201,11 +4358,6 @@ impl VmConfig {
         self.preserved_fds
             .get_or_insert_with(HashSet::new)
             .extend(fds);
-    }
-
-    #[cfg(feature = "tdx")]
-    pub fn is_tdx_enabled(&self) -> bool {
-        self.platform.as_ref().is_some_and(|p| p.tdx)
     }
 
     #[cfg(feature = "sev_snp")]
@@ -4271,14 +4423,128 @@ impl Drop for VmConfig {
 mod tests {
     use std::fs::File;
     use std::os::unix::io::AsRawFd;
+    #[cfg(target_arch = "x86_64")]
+    use std::{env, fs};
 
     use net_util::MacAddr;
 
     use super::*;
 
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_validate_gic_layout() {
+        let floor = arch::layout::UEFI_START.0 + arch::layout::UEFI_SIZE;
+        let its_base = |n: u64| {
+            arch::layout::GIC_V3_DIST_START.0
+                - n * arch::layout::GIC_V3_REDIST_SIZE
+                - arch::layout::GIC_V3_ITS_SIZE
+        };
+        let mut last = 0;
+        while its_base(last + 1) >= floor {
+            last += 1;
+        }
+        let last = u32::try_from(last).unwrap();
+
+        validate_gic_layout(last).unwrap();
+        assert_eq!(
+            validate_gic_layout(last + 1),
+            Err(ValidationError::TooManyCpusForGic(last + 1, last.into()))
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_cpuid_override_parsing_and_serialization() {
+        let config = CpusConfig::parse(
+            "boot=2,x-cpuid-overrides=[[0x7,0x0,0x1,0x2,0x3,0x4], [0x80000001, 0x0, 0x0, 0x0, 0xFFFFFFFF, 0x0]],max=4",
+        )
+        .unwrap();
+        assert_eq!(config.boot_vcpus, 2);
+        assert_eq!(config.max_vcpus, 4);
+        assert_eq!(
+            config.cpuid_overrides,
+            vec![
+                CpuidOverride {
+                    leaf: 7,
+                    subleaf: 0,
+                    eax: 1,
+                    ebx: 2,
+                    ecx: 3,
+                    edx: 4,
+                },
+                CpuidOverride {
+                    leaf: 0x80000001,
+                    subleaf: 0,
+                    eax: 0,
+                    ebx: 0,
+                    ecx: u32::MAX,
+                    edx: 0,
+                },
+            ]
+        );
+        let json = serde_json::to_string(&config).unwrap();
+        assert_eq!(serde_json::from_str::<CpusConfig>(&json).unwrap(), config);
+        assert_eq!(
+            serde_json::to_value(&config).unwrap()["x-cpuid-overrides"][1]["ecx"],
+            "0xffffffff"
+        );
+        assert_eq!(
+            CpusConfig::parse("x-cpuid-overrides=[]").unwrap(),
+            CpusConfig::default()
+        );
+        assert!(
+            serde_json::to_value(CpusConfig::default())
+                .unwrap()
+                .get("x-cpuid-overrides")
+                .is_none()
+        );
+        assert_eq!(
+            serde_json::from_str::<CpusConfig>(r#"{"boot_vcpus":1,"max_vcpus":1}"#).unwrap(),
+            CpusConfig::default()
+        );
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_cpuid_override_invalid_input() {
+        for value in [
+            "0x7",
+            "[0x7,0x0,0x0,0x0,0x0,0x0]",
+            "[[0x7,0x0,0x0,0x0,0x0]]",
+            "[[0x7,0x0,0x0,0x0,0x0,0x0,0x0]]",
+            "[[7,0x0,0x0,0x0,0x0,0x0]]",
+            "[[0x100000000,0x0,0x0,0x0,0x0,0x0]]",
+            "[[0x7,0x0,0x0,0x0,0x0,0xZZ]]",
+            "[[0x7,0x0,0x0,0x0,0x0,0x0],]",
+            "[[0x7,0x0,0x0,0x0,0x0,0x0]",
+        ] {
+            assert!(
+                CpusConfig::parse(&format!("x-cpuid-overrides={value}")).is_err(),
+                "{value}"
+            );
+        }
+        for value in [
+            r#"{"leaf":"0x100000000","subleaf":"0x0","eax":"0x0","ebx":"0x0","ecx":"0x0","edx":"0x0"}"#,
+            r#"{"leaf":7,"subleaf":"0x0","eax":"0x0","ebx":"0x0","ecx":"0x0","edx":"0x0"}"#,
+            r#"{"leaf":"7","subleaf":"0x0","eax":"0x0","ebx":"0x0","ecx":"0x0","edx":"0x0"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<CpuidOverride>(value).is_err(),
+                "{value}"
+            );
+        }
+    }
+
     #[test]
     fn test_cpu_parsing() -> Result<()> {
         assert_eq!(CpusConfig::parse("")?, CpusConfig::default());
+        for host in ["host", "Host", "HOST"] {
+            assert_eq!(
+                CpusConfig::parse(&format!("profile={host}"))?,
+                CpusConfig::default()
+            );
+        }
+        assert_eq!(CpusConfig::parse("profile=")?, CpusConfig::default());
         assert!(CpusConfig::parse("nested=on")?.nested);
         assert!(!CpusConfig::parse("nested=off")?.nested);
 
@@ -4379,6 +4645,34 @@ mod tests {
         // Invalid value should error
         CpusConfig::parse("boot=1,core_scheduling=invalid").unwrap_err();
 
+        Ok(())
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_cpu_profile_file_parsing() -> Result<()> {
+        use vmm_sys_util::tempfile::TempFile;
+
+        let (input, config) = {
+            let file = TempFile::new_with_prefix(
+                env::temp_dir().join("cpu profile:with,commas[and]=signs-"),
+            )
+            .unwrap();
+            // Parsing the selector must not read or validate the file contents.
+            fs::write(file.as_path(), "invalid json").unwrap();
+            let input = format!(
+                r#"boot=2,profile="path:{}",max=4"#,
+                file.as_path().display()
+            );
+            let config = CpusConfig::parse(&input)?;
+            assert_eq!(
+                config.profile,
+                CpuProfileConfig::File(file.as_path().to_owned())
+            );
+            (input, config)
+        };
+
+        assert_eq!(CpusConfig::parse(&input)?, config);
         Ok(())
     }
 
@@ -5050,7 +5344,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
     fn test_parse_vhost_user() -> Result<()> {
         // all parameters must be supplied, except pci_segment
         GenericVhostUserConfig::parse("").unwrap_err();
-        GenericVhostUserConfig::parse("virtio_id=1").unwrap_err();
+        GenericVhostUserConfig::parse("device_type=1").unwrap_err();
         GenericVhostUserConfig::parse("queue_size=1").unwrap_err();
         GenericVhostUserConfig::parse("socket=/tmp/sock").unwrap_err();
         GenericVhostUserConfig::parse("id=1").unwrap_err();
@@ -5090,14 +5384,16 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             &IntegerList(vec![20u64]),
         );
 
-        // The deprecated 'virtio_id' key is an alias for 'device_type' and must
-        // parse to an identical configuration.
-        assert_eq!(
-            GenericVhostUserConfig::parse("virtio_id=26,socket=/tmp/sock,queue_sizes=[1024]")
-                .unwrap(),
-            GenericVhostUserConfig::parse("device_type=26,socket=/tmp/sock,queue_sizes=[1024]")
-                .unwrap(),
-        );
+        for config in [
+            "virtio_id=26,socket=/tmp/sock,queue_sizes=[1024]",
+            "device_type=26,virtio_id=26,socket=/tmp/sock,queue_sizes=[1024]",
+        ] {
+            assert!(matches!(
+                GenericVhostUserConfig::parse(config),
+                Err(Error::ParseGenericVhostUser(OptionParserError::UnknownOption(key)))
+                    if key == "virtio_id"
+            ));
+        }
         Ok(())
     }
 
@@ -5147,7 +5443,12 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
     #[test]
     fn test_console_parsing() -> Result<()> {
         let console_config = |mode, file, socket, iommu| ConsoleConfig {
-            common: CommonConsoleConfig { file, mode, socket },
+            common: CommonConsoleConfig {
+                file,
+                mode,
+                socket,
+                tcp: None,
+            },
             pci_common: PciDeviceCommonConfig {
                 iommu,
                 ..Default::default()
@@ -5203,7 +5504,123 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 IommuType::Virtio
             )
         );
+        assert_eq!(
+            ConsoleConfig::parse("tcp=127.0.0.1:4444")?.common.tcp,
+            Some(TcpConsoleConfig {
+                address: "127.0.0.1:4444".parse().unwrap(),
+                server: true,
+            })
+        );
+        assert_eq!(
+            ConsoleConfig::parse("tcp=[::1]:4444")?.common.tcp,
+            Some(TcpConsoleConfig {
+                address: "[::1]:4444".parse().unwrap(),
+                server: true,
+            })
+        );
+        SerialConfig::parse("tcp=localhost:4444").unwrap_err();
+        for options in ["tcp=127.0.0.1:4444", "tcp=127.0.0.1:4444,server=on"] {
+            let serial = SerialConfig::parse(options)?;
+            let console = ConsoleConfig::parse(options)?;
+            assert_eq!(serial.common, console.common);
+            assert!(serial.common.tcp.as_ref().unwrap().server);
+            serial.validate().unwrap();
+            console.common.validate().unwrap();
+        }
+        for options in ["tcp=127.0.0.1:4444,server=invalid", "null,server=on"] {
+            ConsoleConfig::parse(options).unwrap_err();
+            SerialConfig::parse(options).unwrap_err();
+        }
+        assert!(matches!(
+            SerialConfig::parse("tcp=127.0.0.1:4444,server=off"),
+            Err(Error::Validation(
+                ValidationError::ConsoleTcpClientUnsupported
+            ))
+        ));
+        assert!(matches!(
+            ConsoleConfig::parse("tcp=127.0.0.1:4444,server=off"),
+            Err(Error::Validation(
+                ValidationError::ConsoleTcpClientUnsupported
+            ))
+        ));
         Ok(())
+    }
+
+    #[test]
+    fn test_tcp_console_port_zero_validation() {
+        for address in ["127.0.0.1:0", "[::1]:0"] {
+            let options = format!("tcp={address}");
+            let serial = SerialConfig::parse(&options).unwrap();
+            let console = ConsoleConfig::parse(&options).unwrap();
+            assert_eq!(
+                serial.validate().unwrap_err(),
+                ValidationError::ConsoleTcpPortZero
+            );
+            assert_eq!(
+                console.common.validate().unwrap_err(),
+                ValidationError::ConsoleTcpPortZero
+            );
+
+            let config = serde_json::json!({
+                "mode": "Tcp",
+                "tcp": { "address": address }
+            });
+            let serial: SerialConfig = serde_json::from_value(config.clone()).unwrap();
+            let console: ConsoleConfig = serde_json::from_value(config).unwrap();
+            assert_eq!(
+                serial.validate().unwrap_err(),
+                ValidationError::ConsoleTcpPortZero
+            );
+            assert_eq!(
+                console.common.validate().unwrap_err(),
+                ValidationError::ConsoleTcpPortZero
+            );
+        }
+    }
+
+    #[test]
+    fn test_tcp_console_deserialization() {
+        let config = serde_json::json!({
+            "mode": "Tcp",
+            "tcp": { "address": "127.0.0.1:4444" }
+        });
+        let serial: SerialConfig = serde_json::from_value(config.clone()).unwrap();
+        let console: ConsoleConfig = serde_json::from_value(config.clone()).unwrap();
+        let expected = Some(TcpConsoleConfig {
+            address: "127.0.0.1:4444".parse().unwrap(),
+            server: true,
+        });
+        assert_eq!(serial.common.tcp, expected);
+        assert_eq!(console.common.tcp, expected);
+        serial.validate().unwrap();
+        console.common.validate().unwrap();
+
+        let mut hostname = config.clone();
+        hostname["tcp"]["address"] = serde_json::json!("localhost:4444");
+        serde_json::from_value::<SerialConfig>(hostname.clone()).unwrap_err();
+        serde_json::from_value::<ConsoleConfig>(hostname).unwrap_err();
+
+        let mut explicit = config.clone();
+        explicit["tcp"]["server"] = serde_json::json!(true);
+        assert_eq!(
+            serde_json::from_value::<SerialConfig>(explicit.clone()).unwrap(),
+            serial
+        );
+        assert_eq!(
+            serde_json::from_value::<ConsoleConfig>(explicit.clone()).unwrap(),
+            console
+        );
+        explicit["tcp"]["server"] = serde_json::json!(false);
+        let serial: SerialConfig = serde_json::from_value(explicit.clone()).unwrap();
+        let console: ConsoleConfig = serde_json::from_value(explicit).unwrap();
+        assert_eq!(
+            serial.validate().unwrap_err(),
+            ValidationError::ConsoleTcpClientUnsupported
+        );
+        assert_eq!(
+            console.common.validate().unwrap_err(),
+            ValidationError::ConsoleTcpClientUnsupported
+        );
     }
 
     fn device_fixture() -> DeviceConfig {
@@ -5340,6 +5757,39 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 socket: PathBuf::from("/var/run/tpm.sock"),
             }
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_platform_smbios_parsing() -> Result<()> {
+        let config = PlatformConfig::parse("system_serial_number=serial,system_uuid=uuid")?;
+        assert_eq!(config.system_serial_number.as_deref(), Some("serial"));
+        assert_eq!(config.system_uuid.as_deref(), Some("uuid"));
+
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(json["system_serial_number"], "serial");
+        assert_eq!(json["system_uuid"], "uuid");
+        assert_eq!(
+            serde_json::from_value::<PlatformConfig>(json).unwrap(),
+            config
+        );
+
+        for key in ["serial_number", "uuid"] {
+            for prefix in ["", "system_serial_number=serial,system_uuid=uuid,"] {
+                assert!(matches!(
+                    PlatformConfig::parse(&format!("{prefix}{key}=legacy")),
+                    Err(Error::ParsePlatform(OptionParserError::UnknownOption(option)))
+                        if option == key
+                ));
+            }
+        }
+
+        // Unrecognized JSON fields are ignored, as for other configuration options.
+        let legacy: PlatformConfig =
+            serde_json::from_str(r#"{"serial_number":"legacy","uuid":"legacy"}"#).unwrap();
+        assert_eq!(legacy.system_serial_number, None);
+        assert_eq!(legacy.system_uuid, None);
+
         Ok(())
     }
 
@@ -6073,8 +6523,6 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             system_family: None,
             system_sku_number: None,
             chassis_asset_tag: None,
-            #[cfg(feature = "tdx")]
-            tdx: false,
             #[cfg(feature = "sev_snp")]
             sev_snp: false,
         }
@@ -6088,6 +6536,47 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             device_id: None,
             memory_zones: None,
             pci_segments: None,
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "kvm", feature = "sev_snp"))]
+    fn test_sev_snp_fw_cfg_validation() {
+        let mut config: VmConfig = serde_json::from_value(serde_json::json!({
+            "platform": { "sev_snp": true },
+            "payload": { "igvm": "/path/to/igvm" },
+        }))
+        .unwrap();
+        assert_eq!(
+            config.validate(),
+            Err(ValidationError::SevSnpRequiresFwCfgAcpi)
+        );
+
+        #[cfg(feature = "fw_cfg")]
+        {
+            config.payload.as_mut().unwrap().fw_cfg_config = Some(FwCfgConfig {
+                kernel: false,
+                cmdline: false,
+                initramfs: false,
+                acpi_tables: false,
+                ..Default::default()
+            });
+            assert_eq!(
+                config.validate(),
+                Err(ValidationError::SevSnpRequiresFwCfgAcpi)
+            );
+            config.platform.as_mut().unwrap().sev_snp = false;
+            config.validate().unwrap();
+            config.platform.as_mut().unwrap().sev_snp = true;
+            config
+                .payload
+                .as_mut()
+                .unwrap()
+                .fw_cfg_config
+                .as_mut()
+                .unwrap()
+                .acpi_tables = true;
+            config.validate().unwrap();
         }
     }
 
@@ -6143,6 +6632,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                     file: None,
                     mode: ConsoleOutputMode::Null,
                     socket: None,
+                    tcp: None,
                 },
             },
             console: ConsoleConfig {
@@ -6150,6 +6640,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                     file: None,
                     mode: ConsoleOutputMode::Tty,
                     socket: None,
+                    tcp: None,
                 },
                 pci_common: PciDeviceCommonConfig::default(),
             },
@@ -6242,7 +6733,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             let mut invalid_config = valid_config.clone();
             if let Some(payload) = invalid_config.payload.as_mut() {
                 payload.fw_cfg_config = Some(FwCfgConfig {
-                    e820: true,
+                    e820: cfg!(target_arch = "x86_64"),
                     kernel: false,
                     cmdline: false,
                     initramfs: false,
@@ -6262,6 +6753,12 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                     PayloadConfigError::FwCfgInvalidItem("opt/org.test/invalid".to_string())
                 ))
             );
+
+            #[cfg(target_arch = "aarch64")]
+            {
+                assert!(!FwCfgConfig::default().e820);
+                assert!(!FwCfgConfig::parse("kernel=off").unwrap().e820);
+            }
         }
 
         let mut invalid_config = valid_config.clone();
@@ -6332,6 +6829,15 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         });
         still_valid_config.validate().unwrap();
 
+        // Don't test MAX_SUPPORTED_CPUS because it's not guaranteed
+        // as other limitation might come in earlier.
+        let mut invalid_config = valid_config.clone();
+        invalid_config.cpus.max_vcpus = MAX_SUPPORTED_CPUS + 1;
+        assert_eq!(
+            invalid_config.validate(),
+            Err(ValidationError::TooManyCpus(MAX_SUPPORTED_CPUS + 1))
+        );
+
         #[cfg(target_arch = "x86_64")]
         {
             let mut invalid_config = valid_config.clone();
@@ -6392,6 +6898,13 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         assert_eq!(
             invalid_config.validate(),
             Err(ValidationError::VhostUserRequiresSharedMemory)
+        );
+
+        // Checking for shared memory must not assume memory zones.
+        invalid_config.memory.size = 0;
+        assert_eq!(
+            invalid_config.validate(),
+            Err(ValidationError::MemoryZonesMissing)
         );
 
         let mut still_valid_config = valid_config.clone();
@@ -7237,13 +7750,23 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             neither_path_nor_fd.validate(),
             Err(ValidationError::VfioDeviceNeitherPathNorFd),
         ));
-        #[cfg(feature = "sev_snp")]
+        #[cfg(all(feature = "sev_snp", any(not(feature = "kvm"), feature = "fw_cfg")))]
         {
             let mut sev_snp_config = valid_config.clone();
             sev_snp_config.platform = Some(PlatformConfig {
                 sev_snp: true,
                 ..platform_fixture()
             });
+
+            #[cfg(all(feature = "kvm", feature = "fw_cfg"))]
+            {
+                sev_snp_config.payload.as_mut().unwrap().fw_cfg_config = Some(FwCfgConfig {
+                    kernel: false,
+                    cmdline: false,
+                    initramfs: false,
+                    ..Default::default()
+                });
+            }
 
             // Payload with empty host data
             let mut config_with_no_host_data = sev_snp_config.clone();
@@ -7263,18 +7786,9 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
 
             // Payload with no host data provided
             let mut valid_config_with_no_host_data = sev_snp_config.clone();
-            valid_config_with_no_host_data.payload = Some(PayloadConfig {
-                kernel: Some(PathBuf::from("/path/to/kernel")),
-                firmware: None,
-                cmdline: None,
-                initramfs: None,
-                #[cfg(feature = "igvm")]
-                igvm: Some(PathBuf::from("/path/to/igvm")),
-                #[cfg(feature = "sev_snp")]
-                host_data: None,
-                #[cfg(feature = "fw_cfg")]
-                fw_cfg_config: None,
-            });
+            let payload = valid_config_with_no_host_data.payload.as_mut().unwrap();
+            payload.igvm = Some(PathBuf::from("/path/to/igvm"));
+            payload.host_data = None;
             valid_config_with_no_host_data.validate().unwrap();
 
             // Payload with invalid host data length i.e less than 64
@@ -7314,10 +7828,13 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 Err(ValidationError::SevSnpNoMemoryHotplug)
             );
 
-            let mut invalid_config = sev_snp_config.clone();
-            invalid_config.cpus.max_vcpus = 2;
+            let mut cpu_config = sev_snp_config.clone();
+            cpu_config.cpus.max_vcpus = 2;
+            #[cfg(feature = "kvm")]
+            cpu_config.validate().unwrap();
+            #[cfg(not(feature = "kvm"))]
             assert_eq!(
-                invalid_config.validate(),
+                cpu_config.validate(),
                 Err(ValidationError::SevSnpNoCpuHotplug)
             );
 

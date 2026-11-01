@@ -37,7 +37,7 @@ use crate::{
     VirtioCommon, VirtioDevice, VirtioDeviceType,
 };
 
-const DEFAULT_QUEUE_NUMBER: usize = 2;
+const DEFAULT_QUEUE_NUMBER: u16 = 2;
 
 pub type State = VhostUserState<VirtioNetConfig>;
 
@@ -50,7 +50,6 @@ pub struct Net {
     config: VirtioNetConfig,
     seccomp_action: SeccompAction,
     exit_evt: EventFd,
-    access_platform_enabled: bool,
     announce: AnnouncementState,
 }
 
@@ -95,7 +94,7 @@ impl Net {
         let mut vu = VhostUserHandle::connect_vhost_user(
             server,
             &vu_cfg.socket,
-            num_queues as u64,
+            num_queues,
             false,
             &exit_evt,
             |_| Ok(()),
@@ -123,7 +122,7 @@ impl Net {
             // If the control queue feature has been negotiated, let's
             // increase the number of queues.
             if state.acked_features & (1 << VIRTIO_NET_F_CTRL_VQ) != 0 {
-                num_queues += 1;
+                num_queues = num_queues.checked_add(1).ok_or(Error::BadQueueNum)?;
             }
 
             // Always set the announcement pending if the device was restored and
@@ -185,12 +184,12 @@ impl Net {
                 if acked_protocol_features & VhostUserProtocolFeatures::MQ.bits() != 0 {
                     vu.socket_handle()
                         .get_queue_num()
-                        .map_err(Error::VhostUserGetQueueMaxNum)? as usize
+                        .map_err(Error::VhostUserGetQueueMaxNum)?
                 } else {
-                    DEFAULT_QUEUE_NUMBER
+                    DEFAULT_QUEUE_NUMBER as u64
                 };
 
-            if num_queues > backend_num_queues {
+            if num_queues as u64 > backend_num_queues {
                 error!(
                     "vhost-user-net requested too many queues ({num_queues}) since the backend only supports {backend_num_queues}\n"
                 );
@@ -237,15 +236,18 @@ impl Net {
             // the number of queues.
             let vu_num_queues = num_queues;
             if backend_acked_features & (1 << VIRTIO_NET_F_CTRL_VQ) != 0 {
-                num_queues += 1;
+                num_queues = num_queues.checked_add(1).ok_or(Error::BadQueueNum)?;
             }
 
             // Build the feature set that gets exposed to the guest. Some frontend available
             // features are dependent on the features the backend supports.
-            let guest_avail_features = Self::guest_avail_features(
+            let mut guest_avail_features = Self::guest_avail_features(
                 backend_acked_features,
                 backend_provides_mtu || mtu.is_some(),
             );
+            if access_platform_enabled {
+                guest_avail_features |= 1u64 << VIRTIO_F_ACCESS_PLATFORM;
+            }
 
             (
                 guest_avail_features,
@@ -268,11 +270,11 @@ impl Net {
             vu_common: VhostUserCommon {
                 virtio_common: VirtioCommon {
                     device_type: VirtioDeviceType::Net as u32,
-                    queue_sizes: vec![vu_cfg.queue_size; num_queues],
+                    queue_sizes: vec![vu_cfg.queue_size; num_queues as usize],
                     avail_features,
                     acked_features,
                     paused_sync: Some(Arc::new(Barrier::new(2))),
-                    min_queues: DEFAULT_QUEUE_NUMBER as u16,
+                    min_queues: DEFAULT_QUEUE_NUMBER,
                     paused: Arc::new(AtomicBool::new(paused)),
                     ..Default::default()
                 },
@@ -287,7 +289,6 @@ impl Net {
             config,
             seccomp_action,
             exit_evt,
-            access_platform_enabled,
             announce: AnnouncementState::new(announce_pending).map_err(Error::CreateEventFd)?,
         })
     }
@@ -337,11 +338,7 @@ impl VirtioDevice for Net {
     }
 
     fn features(&self) -> u64 {
-        let mut features = self.vu_common.virtio_common.avail_features;
-        if self.access_platform_enabled {
-            features |= 1u64 << VIRTIO_F_ACCESS_PLATFORM;
-        }
-        features
+        self.vu_common.virtio_common.avail_features
     }
 
     fn ack_features(&mut self, value: u64) {
@@ -365,7 +362,7 @@ impl VirtioDevice for Net {
             .virtio_common
             .activate(&queues, Arc::clone(&interrupt_cb))?;
 
-        let num_queues = queues.len();
+        let num_queues = u16::try_from(queues.len()).map_err(|_| ActivateError::BadActivate)?;
         let event_idx = self
             .vu_common
             .virtio_common
@@ -377,7 +374,7 @@ impl VirtioDevice for Net {
             && !num_queues.is_multiple_of(2)
         {
             let ctrl_queue_index = num_queues - 1;
-            let (_, mut ctrl_queue, ctrl_queue_evt) = queues.remove(ctrl_queue_index);
+            let (_, mut ctrl_queue, ctrl_queue_evt) = queues.remove(ctrl_queue_index as usize);
 
             ctrl_queue.set_event_idx(event_idx);
 
@@ -410,7 +407,7 @@ impl VirtioDevice for Net {
                 queue_evt: ctrl_queue_evt,
                 access_platform: None,
                 interrupt_cb: Arc::clone(&interrupt_cb),
-                queue_index: ctrl_queue_index as u16,
+                queue_index: ctrl_queue_index,
                 announce_evt: self
                     .announce
                     .evt
@@ -578,7 +575,6 @@ mod tests {
             config: VirtioNetConfig::default(),
             seccomp_action: SeccompAction::Allow,
             exit_evt: EventFd::new(libc::EFD_NONBLOCK).unwrap(),
-            access_platform_enabled: false,
             announce: AnnouncementState::new(false).map_err(Error::CreateEventFd)?,
         })
     }

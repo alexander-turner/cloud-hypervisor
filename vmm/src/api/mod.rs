@@ -36,6 +36,7 @@ pub mod http;
 use std::collections::HashSet;
 use std::io;
 use std::num::{NonZeroU32, NonZeroU64};
+use std::os::fd::RawFd;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::mpsc::{RecvError, SendError, Sender, channel};
@@ -327,10 +328,17 @@ pub struct VmReceiveMigrationData {
     pub vfio_fds: Option<Vec<RestoredVfioConfig>>,
     // FDs are not serialized and any deserialized value is invalid; see NetConfig::fds.
     #[serde(default, deserialize_with = "deserialize_restored_fd")]
-    pub iommufd_fd: Option<i32>,
+    pub iommufd_fd: Option<RawFd>,
     /// Optional memory zone update data
     #[serde(default)]
     pub zone_updates: Vec<VmMemoryZoneUpdateData>,
+    /// Enable the background thread for faulting all remaining pages.
+    #[serde(default = "default_receive_migration_background_fetch_pages")]
+    pub background_fetch_pages: bool,
+}
+
+fn default_receive_migration_background_fetch_pages() -> bool {
+    true
 }
 
 #[derive(Debug, Error)]
@@ -382,7 +390,7 @@ impl VmReceiveMigrationData {
     pub const SYNTAX: &'static str = "VM receive migration parameters \
         \"<receiver_url>\" or \"receiver_url=<url>[,tls_dir=<path>]\
         [,vfio_fds=<list_of_vfio_ids_with_their_associated_fd>][,iommufd_fd=<fd>]\
-        [,zone_updates=[<id@host_numa_node>]]\"";
+        [,zone_updates=[<id@host_numa_node>]][,background_fetch_pages=on|off]\"";
 
     pub fn parse(migration: &str) -> Result<Self, VmReceiveMigrationConfigError> {
         let mut parser = OptionParser::new();
@@ -391,7 +399,8 @@ impl VmReceiveMigrationData {
             .add("tls_dir")
             .add("vfio_fds")
             .add("iommufd_fd")
-            .add("zone_updates");
+            .add("zone_updates")
+            .add("background_fetch_pages");
         parser
             .parse(migration)
             .map_err(VmReceiveMigrationConfigError::ParseError)?;
@@ -412,12 +421,12 @@ impl VmReceiveMigrationData {
                 v.0.iter()
                     .map(|Tuple(id, fd)| RestoredVfioConfig {
                         id: id.clone(),
-                        fd: Some(*fd as i32),
+                        fd: Some(*fd as RawFd),
                     })
                     .collect()
             });
         let iommufd_fd = parser
-            .convert::<i32>("iommufd_fd")
+            .convert::<RawFd>("iommufd_fd")
             .map_err(VmReceiveMigrationConfigError::ParseError)?;
 
         let zone_updates: Vec<VmMemoryZoneUpdateData> = parser
@@ -432,12 +441,19 @@ impl VmReceiveMigrationData {
                     .collect()
             });
 
+        let background_fetch_pages = parser
+            .convert::<Toggle>("background_fetch_pages")
+            .map_err(VmReceiveMigrationConfigError::ParseError)?
+            .unwrap_or(Toggle(true))
+            .0;
+
         let data = Self {
             receiver_url,
             tls_dir,
             vfio_fds,
             iommufd_fd,
             zone_updates,
+            background_fetch_pages,
         };
 
         data.validate()?;
@@ -2262,6 +2278,29 @@ mod tests {
     }
 
     #[test]
+    fn test_vm_receive_migration_data_background_fetch_pages() {
+        let data = VmReceiveMigrationData::parse("receiver_url=unix:/tmp/sock").unwrap();
+        assert!(data.background_fetch_pages);
+
+        let data =
+            VmReceiveMigrationData::parse("receiver_url=unix:/tmp/sock,background_fetch_pages=off")
+                .unwrap();
+        assert!(!data.background_fetch_pages);
+
+        let data =
+            VmReceiveMigrationData::parse("receiver_url=unix:/tmp/sock,background_fetch_pages=on")
+                .unwrap();
+        assert!(data.background_fetch_pages);
+
+        VmReceiveMigrationData::parse("receiver_url=unix:/tmp/sock,background_fetch_pages=maybe")
+            .unwrap_err();
+
+        let data: VmReceiveMigrationData =
+            serde_json::from_str(r#"{"receiver_url":"unix:/tmp/sock"}"#).unwrap();
+        assert!(data.background_fetch_pages);
+    }
+
+    #[test]
     fn test_vm_receive_migration_data_parse() {
         let data = VmReceiveMigrationData::parse("receiver_url=tcp:192.168.1.1:8080").unwrap();
         assert_eq!(
@@ -2272,6 +2311,7 @@ mod tests {
                 vfio_fds: None,
                 iommufd_fd: None,
                 zone_updates: vec![],
+                background_fetch_pages: true,
             }
         );
 
@@ -2301,6 +2341,7 @@ mod tests {
                 vfio_fds: None,
                 iommufd_fd: None,
                 zone_updates: vec![],
+                background_fetch_pages: true,
             }
         );
 

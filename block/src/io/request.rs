@@ -19,7 +19,7 @@ use log::{error, warn};
 use smallvec::SmallVec;
 use virtio_bindings::virtio_blk::{
     VIRTIO_BLK_T_DISCARD, VIRTIO_BLK_T_WRITE_ZEROES, VIRTIO_BLK_WRITE_ZEROES_FLAG_UNMAP,
-    virtio_blk_discard_write_zeroes,
+    virtio_blk_discard_write_zeroes, virtio_blk_outhdr,
 };
 use virtio_queue::DescriptorChain;
 use vm_memory::bitmap::Bitmap;
@@ -96,6 +96,10 @@ impl Request {
         // The head contains the request type which MUST be readable.
         if hdr_desc.is_write_only() {
             return Err(Error::UnexpectedWriteOnlyDescriptor);
+        }
+
+        if (hdr_desc.len() as usize) < size_of::<virtio_blk_outhdr>() {
+            return Err(Error::DescriptorLengthTooSmall);
         }
 
         let hdr_desc_addr = hdr_desc.addr();
@@ -250,53 +254,18 @@ impl Request {
         };
         // Queue operations expected to be submitted.
         match request_type {
-            RequestType::In => {
-                self.mark_read_dirty(&mem)?;
+            RequestType::In | RequestType::Out => {
                 let op = self.build_data_operation(mem, offset, alignment, user_data)?;
                 if disk_image.batch_requests_enabled() {
                     ret.batch_request = Some(op);
                 } else {
-                    match op {
-                        AsyncIoOperation::ReadToMemory {
-                            offset,
-                            target,
-                            user_data,
-                        } => disk_image
-                            .read_to_memory(offset, target, user_data)
-                            .map_err(ExecuteError::AsyncRead)?,
-                        AsyncIoOperation::ReadToVec {
-                            offset,
-                            buffer,
-                            user_data,
-                        } => disk_image
-                            .read_to_vec(offset, buffer, user_data)
-                            .map_err(ExecuteError::AsyncRead)?,
-                        _ => unreachable!("unexpected read operation"),
-                    }
-                }
-            }
-            RequestType::Out => {
-                let op = self.build_data_operation(mem, offset, alignment, user_data)?;
-                if disk_image.batch_requests_enabled() {
-                    ret.batch_request = Some(op);
-                } else {
-                    match op {
-                        AsyncIoOperation::WriteFromMemory {
-                            offset,
-                            target,
-                            user_data,
-                        } => disk_image
-                            .write_from_memory(offset, target, user_data)
-                            .map_err(ExecuteError::AsyncWrite)?,
-                        AsyncIoOperation::WriteFromVec {
-                            offset,
-                            buffer,
-                            user_data,
-                        } => disk_image
-                            .write_from_vec(offset, buffer, user_data)
-                            .map_err(ExecuteError::AsyncWrite)?,
-                        _ => unreachable!("unexpected write operation"),
-                    }
+                    disk_image.submit_data_operation(op).map_err(|e| {
+                        if request_type == RequestType::In {
+                            ExecuteError::AsyncRead(e)
+                        } else {
+                            ExecuteError::AsyncWrite(e)
+                        }
+                    })?;
                 }
             }
             RequestType::Flush => {
@@ -458,30 +427,45 @@ impl Request {
         &self,
         mem: Arc<vm_memory::GuestMemoryMmap<B>>,
         offset: libc::off_t,
-        alignment: u64,
+        alignment: Option<u64>,
         user_data: u64,
     ) -> Result<AsyncIoOperation, ExecuteError> {
-        if self.guest_memory_is_aligned(&mem, alignment)? {
-            let target = GuestMemoryTarget::new(mem, &self.data_descriptors)
-                .map_err(ExecuteError::GetHostAddress)?;
+        if offset < 0 {
+            return Err(ExecuteError::BadRequest(Error::InvalidOffset));
+        }
+
+        if let Some(alignment) = alignment
+            && (!(offset as u64).is_multiple_of(alignment)
+                || !(self.data_len() as u64).is_multiple_of(alignment))
+        {
+            return Err(ExecuteError::BadRequest(Error::InvalidDataAlignment(
+                alignment,
+            )));
+        }
+
+        if let Some(alignment) = alignment
+            && !self.guest_memory_is_aligned(&mem, alignment)?
+        {
+            // The guest-memory buffers are unaligned, so use an aligned bounce buffer.
+            let mut buffer = OwnedIoBuffer::new(self.data_len(), alignment as usize)
+                .map_err(ExecuteError::TemporaryBufferAllocation)?;
+
+            if self.request_type == RequestType::Out {
+                self.copy_guest_to_buffer(&mem, buffer.as_mut_slice())?;
+            }
+
             return Ok(match self.request_type {
-                RequestType::In => AsyncIoOperation::read_to_memory(offset, target, user_data),
-                RequestType::Out => AsyncIoOperation::write_from_memory(offset, target, user_data),
+                RequestType::In => AsyncIoOperation::read_to_vec(offset, buffer, user_data),
+                RequestType::Out => AsyncIoOperation::write_from_vec(offset, buffer, user_data),
                 _ => unreachable!("unexpected data operation type"),
             });
         }
 
-        // The guest-memory buffers are unaligned, so use an aligned bounce buffer.
-        let mut buffer = OwnedIoBuffer::new(self.data_len(), alignment as usize)
-            .map_err(ExecuteError::TemporaryBufferAllocation)?;
-
-        if self.request_type == RequestType::Out {
-            self.copy_guest_to_buffer(&mem, buffer.as_mut_slice())?;
-        }
-
+        let target = GuestMemoryTarget::new(mem, &self.data_descriptors)
+            .map_err(ExecuteError::GetHostAddress)?;
         Ok(match self.request_type {
-            RequestType::In => AsyncIoOperation::read_to_vec(offset, buffer, user_data),
-            RequestType::Out => AsyncIoOperation::write_from_vec(offset, buffer, user_data),
+            RequestType::In => AsyncIoOperation::read_to_memory(offset, target, user_data),
+            RequestType::Out => AsyncIoOperation::write_from_memory(offset, target, user_data),
             _ => unreachable!("unexpected data operation type"),
         })
     }
@@ -528,16 +512,26 @@ impl Request {
             .sum()
     }
 
-    // Marks guest-memory read destinations dirty before submitting async IO.
+    // Marks the first `len` bytes of the read destinations dirty.
     fn mark_read_dirty<B: Bitmap + 'static>(
         &self,
         mem: &vm_memory::GuestMemoryMmap<B>,
-    ) -> Result<(), ExecuteError> {
+        len: usize,
+    ) -> Result<(), Error> {
+        let mut remaining = len;
         for (data_addr, data_len) in &self.data_descriptors {
-            mem.get_slice(*data_addr, *data_len as usize)
-                .map_err(ExecuteError::GetHostAddress)?
+            if *data_len == 0 {
+                continue;
+            }
+            if remaining == 0 {
+                break;
+            }
+            let data_len = (*data_len as usize).min(remaining);
+            mem.get_slice(*data_addr, data_len)
+                .map_err(Error::GuestMemory)?
                 .bitmap()
-                .mark_dirty(0, *data_len as usize);
+                .mark_dirty(0, data_len);
+            remaining -= data_len;
         }
         Ok(())
     }
@@ -582,12 +576,17 @@ impl Request {
         mem: &vm_memory::GuestMemoryMmap<B>,
         completion: &mut AsyncIoCompletion,
     ) -> Result<(), Error> {
-        if self.request_type == RequestType::In
-            && completion.result > 0
-            && let Some(buffer) = completion.buffer.take()
-        {
-            let len = (completion.result as usize).min(buffer.as_slice().len());
-            self.copy_buffer_to_guest(mem, &buffer.as_slice()[..len])?;
+        if self.request_type == RequestType::In && completion.result > 0 {
+            if let Some(buffer) = completion.buffer.take() {
+                let len = (completion.result as usize).min(buffer.as_slice().len());
+                self.copy_buffer_to_guest(mem, &buffer.as_slice()[..len])?;
+            } else {
+                // No bounce buffer: the kernel read through raw iovecs (io_uring,
+                // AIO or preadv()) straight into guest memory, which bypasses the
+                // dirty bitmap. Formats that copy the data themselves already
+                // marked it, so marking it again is harmless.
+                self.mark_read_dirty(mem, completion.result as usize)?;
+            }
         }
 
         Ok(())
@@ -632,9 +631,6 @@ impl Request {
                 .checked_add(u64::from(*data_len))
                 .ok_or(ExecuteError::BadRequest(Error::InvalidOffset))?;
         }
-        if total_bytes == 0 {
-            return Ok(());
-        }
         if !total_bytes.is_multiple_of(SECTOR_SIZE) {
             return Err(ExecuteError::BadRequest(Error::InvalidDataLength));
         }
@@ -660,14 +656,28 @@ mod tests {
     use super::*;
     use crate::async_io::{AsyncIo, AsyncIoCompletion, AsyncIoOperation, AsyncIoResult};
 
-    struct PanicAsyncIo(EventFd);
+    /// Records submitted data operations instead of performing them.
+    struct RecordingAsyncIo {
+        notifier: EventFd,
+        submitted: Vec<AsyncIoOperation>,
+    }
 
-    impl AsyncIo for PanicAsyncIo {
-        fn notifier(&self) -> &EventFd {
-            &self.0
+    impl RecordingAsyncIo {
+        fn new() -> Self {
+            Self {
+                notifier: EventFd::new(0).unwrap(),
+                submitted: Vec::new(),
+            }
         }
-        fn submit_data_operation(&mut self, _: AsyncIoOperation) -> AsyncIoResult<()> {
-            unreachable!()
+    }
+
+    impl AsyncIo for RecordingAsyncIo {
+        fn notifier(&self) -> &EventFd {
+            &self.notifier
+        }
+        fn submit_data_operation(&mut self, op: AsyncIoOperation) -> AsyncIoResult<()> {
+            self.submitted.push(op);
+            Ok(())
         }
         fn fsync(&mut self, _: Option<u64>) -> AsyncIoResult<()> {
             unreachable!()
@@ -680,6 +690,73 @@ mod tests {
         }
         fn next_completed_request(&mut self) -> Option<AsyncIoCompletion> {
             None
+        }
+    }
+
+    #[test]
+    fn invalid_data_operations_are_rejected() {
+        let mem = Arc::new(GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 8192)]).unwrap());
+        for request_type in [RequestType::In, RequestType::Out] {
+            for (alignment, offset, len) in [
+                (Some(4096), 512, 4096),
+                (Some(4096), 0, 512),
+                (None, -512, 0),
+                (Some(4096), -512, 0),
+            ] {
+                let request = Request {
+                    request_type,
+                    sector: 0,
+                    data_descriptors: SmallVec::from_slice(&[(GuestAddress(0), len)]),
+                    status_addr: GuestAddress(8191),
+                    writeback: true,
+                    start: Instant::now(),
+                };
+                let result = request.build_data_operation(Arc::clone(&mem), offset, alignment, 1);
+                if offset < 0 {
+                    assert!(matches!(
+                        result,
+                        Err(ExecuteError::BadRequest(Error::InvalidOffset))
+                    ));
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(ExecuteError::BadRequest(Error::InvalidDataAlignment(4096)))
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unaligned_guest_buffers_are_bounced() {
+        let mem = Arc::new(GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 8192)]).unwrap());
+        mem.write_slice(&vec![0x5a; 4096], GuestAddress(1)).unwrap();
+        for request_type in [RequestType::In, RequestType::Out] {
+            let request = Request {
+                request_type,
+                sector: 8,
+                data_descriptors: SmallVec::from_slice(&[
+                    (GuestAddress(1), 512),
+                    (GuestAddress(513), 3584),
+                ]),
+                status_addr: GuestAddress(8191),
+                writeback: true,
+                start: Instant::now(),
+            };
+            let op = request
+                .build_data_operation(Arc::clone(&mem), 4096, Some(4096), 1)
+                .unwrap();
+            assert_eq!(op.offset(), 4096);
+            assert_eq!(op.total_len(), 4096);
+            assert_eq!(op.iovecs().len(), 1);
+            assert!((op.iovecs()[0].iov_base as usize).is_multiple_of(4096));
+            match op {
+                AsyncIoOperation::WriteFromVec { buffer, .. } => {
+                    assert!(buffer.as_slice().iter().all(|byte| *byte == 0x5a));
+                }
+                AsyncIoOperation::ReadToVec { .. } => {}
+                _ => panic!("Expected an owned bounce buffer"),
+            }
         }
     }
 
@@ -699,12 +776,128 @@ mod tests {
             writeback: true,
             start: Instant::now(),
         };
-        let mut disk = PanicAsyncIo(EventFd::new(0).unwrap());
+        let mut disk = RecordingAsyncIo::new();
 
         let Err(ExecuteError::BadRequest(Error::InvalidOffset)) =
             request.execute_async(mem, 1024, &mut disk, &[], 0)
         else {
             panic!("expected BadRequest(InvalidOffset)");
         };
+    }
+
+    /// Drives the real submit path: page-aligned buffers are read straight
+    /// into guest memory, the completion is built from the submitted
+    /// operation as the engines do, and the dirty log is harvested while the
+    /// read is in flight, as the migration thread does. A mark placed before
+    /// the submit does not survive that harvest.
+    #[test]
+    fn read_marks_survive_a_dirty_log_harvest_while_in_flight() {
+        use vm_memory::bitmap::AtomicBitmap;
+        use vm_memory::{GuestMemoryBackend, GuestMemoryRegion};
+
+        let mem = Arc::new(
+            GuestMemoryMmap::<AtomicBitmap>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap(),
+        );
+        // One page at 0x1000, two pages at 0x4000
+        let mut request = Request {
+            request_type: RequestType::In,
+            sector: 0,
+            data_descriptors: SmallVec::from_slice(&[
+                (GuestAddress(0x1000), 0x1000),
+                (GuestAddress(0x4000), 0x2000),
+            ]),
+            status_addr: GuestAddress(0),
+            writeback: true,
+            start: Instant::now(),
+        };
+        let mut disk = RecordingAsyncIo::new();
+        request
+            .execute_async(Arc::clone(&mem), 1024, &mut disk, &[], 0)
+            .unwrap();
+        let op = disk.submitted.pop().unwrap();
+        assert!(matches!(op, AsyncIoOperation::ReadToMemory { .. }));
+
+        // The interesting part: the migration thread harvests the dirty log
+        // while the read is still in flight. A page marked dirty at submit
+        // time is consumed here, and nothing would mark it dirty again.
+        let region = mem.find_region(GuestAddress(0)).unwrap();
+        (**region).bitmap().get_and_reset();
+
+        // The backend filled the first buffer and one page of the second
+        let mut completion = AsyncIoCompletion::from_operation(op, 0x2000);
+        request.complete_async(&mem, &mut completion).unwrap();
+
+        let bitmap = region.bitmap();
+        assert!(bitmap.dirty_at(0x1000));
+        assert!(bitmap.dirty_at(0x4000));
+        assert!(!bitmap.dirty_at(0x5000));
+    }
+
+    // A request without data still has to start within the disk.
+    #[test]
+    fn zero_length_request_past_capacity_is_rejected() {
+        for request_type in [RequestType::In, RequestType::Out] {
+            for (sector, valid) in [(1024, true), (1025, false), (1 << 54, false)] {
+                let request = Request {
+                    request_type,
+                    sector,
+                    data_descriptors: SmallVec::from_slice(&[(GuestAddress(0), 0)]),
+                    status_addr: GuestAddress(0),
+                    writeback: true,
+                    start: Instant::now(),
+                };
+                let result = request.check_data_bounds(1024);
+                if valid {
+                    result.expect("an empty request at capacity should be accepted");
+                } else {
+                    assert!(
+                        matches!(result, Err(ExecuteError::BadRequest(Error::InvalidOffset))),
+                        "empty request at sector {sector} was accepted"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn short_header_descriptor_is_rejected() {
+        use virtio_bindings::virtio_blk::VIRTIO_BLK_T_IN;
+        use virtio_bindings::virtio_ring::{VRING_DESC_F_NEXT, VRING_DESC_F_WRITE};
+        use virtio_queue::QueueT;
+        use vm_memory::bitmap::AtomicBitmap;
+        use vm_memory::{GuestAddressSpace, GuestMemoryAtomic};
+        use vm_virtio::queue::testing::VirtQueue as GuestQ;
+
+        let mem =
+            GuestMemoryMmap::<AtomicBitmap>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        mem.write_obj(VIRTIO_BLK_T_IN, GuestAddress(0x2000))
+            .unwrap();
+        let mem_atomic = GuestMemoryAtomic::new(mem.clone());
+
+        for (hdr_len, valid) in [(0, false), (8, false), (15, false), (16, true)] {
+            let vq = GuestQ::new(GuestAddress(0x1000), &mem, 4);
+            vq.dtable[0].set(0x2000, hdr_len, VRING_DESC_F_NEXT as u16, 1);
+            vq.dtable[1].set(
+                0x3000,
+                512,
+                (VRING_DESC_F_NEXT | VRING_DESC_F_WRITE) as u16,
+                2,
+            );
+            vq.dtable[2].set(0x4000, 1, VRING_DESC_F_WRITE as u16, 0);
+            vq.avail.ring[0].set(0);
+            vq.avail.idx.set(1);
+
+            let mut queue = vq.create_queue();
+            let mut chain = queue.pop_descriptor_chain(mem_atomic.memory()).unwrap();
+            let result = Request::parse(&mut chain, None);
+            if valid {
+                assert_eq!(result.unwrap().request_type(), RequestType::In);
+            } else {
+                assert!(
+                    matches!(result, Err(Error::DescriptorLengthTooSmall)),
+                    "header of {hdr_len} bytes was accepted"
+                );
+            }
+        }
     }
 }

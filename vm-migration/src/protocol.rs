@@ -146,8 +146,6 @@ pub enum Command {
     /// Finalizes the migration and resumes the VM on the destination.
     /// Sent when the source VM was running at migration time.
     Complete = 5,
-    #[deprecated = "v52 was the last version to send this command: we now rely on proper timeout and EOF handling on the destination"]
-    Abandon = 6,
     MemoryFd = 7,
     /// Finalizes the migration without resuming the VM on the destination.
     /// Sent when the source VM was paused at migration time.
@@ -429,7 +427,7 @@ impl MemoryRange {
 }
 
 /// A set of guest-memory ranges to transfer as one migration payload.
-#[derive(Clone, Default, Debug, Serialize, Deserialize)]
+#[derive(Clone, Default, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryRangeTable {
     data: Vec<MemoryRange>,
 }
@@ -498,12 +496,22 @@ impl MemoryRangeTable {
         &self.data
     }
 
+    /// Sorts the ranges by guest address.
+    pub fn sort(&mut self) {
+        self.data.sort_unstable_by_key(|range| range.gpa);
+    }
+
     pub fn push(&mut self, range: MemoryRange) {
         self.data.push(range);
     }
 
     pub fn read_from(fd: &mut dyn Read, length: u64) -> Result<MemoryRangeTable, MigratableError> {
-        assert!((length as usize).is_multiple_of(size_of::<MemoryRange>()));
+        if !(length as usize).is_multiple_of(size_of::<MemoryRange>()) {
+            return Err(MigratableError::MigrateReceive(anyhow!(
+                "Memory range table size {length} must be a multiple of MemoryRange size {}",
+                size_of::<MemoryRange>()
+            )));
+        }
 
         let mut data: Vec<MemoryRange> =
             vec![MemoryRange::default(); length as usize / size_of::<MemoryRange>()];
@@ -518,9 +526,8 @@ impl MemoryRangeTable {
         (size_of::<MemoryRange>() * self.data.len()) as u64
     }
 
-    pub fn write_to(&self, fd: &mut dyn Write) -> Result<(), MigratableError> {
-        fd.write_all(self.data.as_bytes())
-            .map_err(MigratableError::MigrateSocket)
+    pub fn as_bytes(&self) -> &[u8] {
+        self.data.as_bytes()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -533,6 +540,7 @@ impl MemoryRangeTable {
 
     /// Merges `self` and `other` and combines adjacent and overlapping ranges
     /// into a continuous and sorted table.
+    #[must_use]
     pub fn merge(mut self, other: Self) -> Self {
         self.data.extend(other.data);
         // Faster than sort_unstable() as both ranges are mostly sorted already.
@@ -652,6 +660,20 @@ mod tests {
     use crate::protocol::{
         CURRENT_PROTOCOL_VERSION, Command, ConnectionRole, MemoryRange, MemoryRangeTable, Request,
     };
+
+    #[test]
+    fn test_memory_range_table_incorrect_length() {
+        let mut fd = Cursor::new(vec![0u8; 8]);
+        MemoryRangeTable::read_from(&mut fd, 7).unwrap_err();
+
+        let bytes = MemoryRangeTable::from(&[(0x1000u64, 0x2000u64)])
+            .as_bytes()
+            .to_vec();
+        let len = bytes.len() as u64;
+        let mut fd = Cursor::new(bytes);
+        let table = MemoryRangeTable::read_from(&mut fd, len).unwrap();
+        assert_eq!(table.as_bytes().len() as u64, len);
+    }
 
     #[test]
     fn test_start_request_ignores_residual_command_headers_bytes() {

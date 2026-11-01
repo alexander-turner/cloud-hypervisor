@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use std::fmt;
 use std::fmt::{Debug, Formatter};
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -17,6 +16,7 @@ use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError, channel, sync_
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+use std::{fmt, mem};
 
 use anyhow::{Context, anyhow};
 use log::{debug, error, info, warn};
@@ -33,6 +33,7 @@ use vm_migration::protocol::{Command, ConnectionRole, MemoryRangeTable, Request,
 use vm_migration::tls::{TlsServerConfig, TlsStream};
 use vm_migration::{MigratableError, Snapshot};
 use vmm_sys_util::eventfd::EventFd;
+use zerocopy::IntoBytes;
 
 use crate::seccomp_filters::{Thread, get_seccomp_filter};
 use crate::sync_utils::Gate;
@@ -42,6 +43,14 @@ use crate::{GuestMemoryMmap, VmMigrationConfig};
 /// Hard upper bound for migration worker connections on both the sender and
 /// receiver side.
 pub(crate) const MAX_MIGRATION_CONNECTIONS: u32 = 128;
+
+/// Timeout for each setup step of a new connection on the receive side.
+pub(crate) const CONNECTION_SETUP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Time after which a migration peer without progress is considered gone.
+/// Applies to the TCP user timeout and to each read and write of the sender,
+/// including its TLS handshake.
+const UNRESPONSIVE_PEER_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Transport-agnostic listener used to receive connections.
 #[derive(Debug)]
@@ -61,7 +70,7 @@ impl ReceiveListener {
                     .context("Failed to accept TCP migration connection")
                     .map_err(MigratableError::MigrateReceive)?;
 
-                set_tcp_keepalive_and_user_timeout(&socket)
+                set_migration_tcp_options(&socket)
                     .context("Failed to set socket options")
                     .map_err(MigratableError::MigrateReceive)?;
 
@@ -78,15 +87,15 @@ impl ReceiveListener {
                     .context("Failed to accept TCP connection")
                     .map_err(MigratableError::MigrateReceive)?;
 
-                set_tcp_keepalive_and_user_timeout(&socket)
+                set_migration_tcp_options(&socket)
                     .context("Failed to set socket options")
                     .map_err(MigratableError::MigrateReceive)?;
 
-                TlsStream::new_server(socket, config)
-                    .map(Box::new)
-                    .map(SocketStream::Tls)
-                    .context("Failed to accept TLS migration connection")
-                    .map_err(MigratableError::MigrateReceive)
+                let stream = tls_handshake(socket, CONNECTION_SETUP_TIMEOUT, |socket| {
+                    TlsStream::new_server(socket, config)
+                })?;
+
+                Ok(SocketStream::Tls(Box::new(stream)))
             }
         }
     }
@@ -191,6 +200,14 @@ impl SocketStream {
             SocketStream::Unix(s) => s.set_read_timeout(dur),
             SocketStream::Tcp(s) => s.set_read_timeout(dur),
             SocketStream::Tls(s) => s.tcp_stream().set_read_timeout(dur),
+        }
+    }
+
+    pub(crate) fn set_write_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
+        match self {
+            SocketStream::Unix(s) => s.set_write_timeout(dur),
+            SocketStream::Tcp(s) => s.set_write_timeout(dur),
+            SocketStream::Tls(s) => s.tcp_stream().set_write_timeout(dur),
         }
     }
 
@@ -417,7 +434,17 @@ impl ReceiveAdditionalConnections {
         seccomp_filter: &BpfProgram,
     ) -> Result<(), MigratableError> {
         loop {
-            let socket = listener.abortable_accept(kill_evt)?;
+            let socket = match listener.abortable_accept(kill_evt) {
+                // A failed TLS handshake only concerns that connection.
+                Err(e @ MigratableError::Tls(_)) => {
+                    warn!(
+                        "TLS handshake failed, dropping connection: {}",
+                        flatten_error_chain_to_string(&e)
+                    );
+                    continue;
+                }
+                result => result?,
+            };
             let Some(socket) = socket else {
                 return Ok(());
             };
@@ -455,7 +482,7 @@ impl ReceiveAdditionalConnections {
         // Timeout the role header so one stalled peer cannot block the accept
         // thread from handling other connections.
         socket
-            .set_read_timeout(Some(Duration::from_secs(10)))
+            .set_read_timeout(Some(CONNECTION_SETUP_TIMEOUT))
             .map_err(MigratableError::MigrateSocket)?;
 
         let role = match ConnectionRole::read_from(&mut socket) {
@@ -721,7 +748,7 @@ impl SendAdditionalConnections {
         // the memory chunks to the workers, but does not send memory anymore. Thus in
         // this case we create one additional thread for each connection.
         for n in 0..configured_connections {
-            let mut socket = send_migration_socket(destination, tls_dir)?;
+            let mut socket = connect_and_setup_socket(destination, tls_dir)?;
             ConnectionRole::PrecopyMemory.write_to(&mut socket)?;
             let guest_memory = guest_memory.clone();
             let message_rx = Arc::clone(&message_rx);
@@ -1067,10 +1094,9 @@ pub(crate) fn tcp_address_to_server_name(address: &str) -> Result<&str, TcpAddre
     Ok(host)
 }
 
-/// Enables `SO_KEEPALIVE` and `TCP_USER_TIMEOUT` for the `tcp_stream`'s socket.
-///
-/// The set options target a failure detection time of two to three minutes.
-fn set_tcp_keepalive_and_user_timeout(tcp_stream: &TcpStream) -> io::Result<()> {
+/// Sets common TCP socket options (nodelay, timeout handling) shared by all
+/// connections.
+fn set_migration_tcp_options(tcp_stream: &TcpStream) -> io::Result<()> {
     /// [`TcpKeepalive`] config for migration TCP sockets.
     ///
     /// After 60 seconds, the kernel starts sending keepalive probes.
@@ -1091,11 +1117,54 @@ fn set_tcp_keepalive_and_user_timeout(tcp_stream: &TcpStream) -> io::Result<()> 
     // https://github.com/rust-lang/rust/issues/155889 is stabilized.
     socket_ref.set_tcp_keepalive(&MIGRATION_TCP_KEEPALIVE)?;
 
-    socket_ref.set_tcp_user_timeout(Some(Duration::from_secs(120)))
+    socket_ref.set_tcp_user_timeout(Some(UNRESPONSIVE_PEER_TIMEOUT))?;
+
+    tcp_stream.set_nodelay(true)
 }
 
-/// Connect to a migration endpoint and return the established stream.
-pub(crate) fn send_migration_socket(
+fn tls_handshake(
+    socket: TcpStream,
+    timeout: Duration,
+    handshake: impl FnOnce(TcpStream) -> Result<TlsStream, MigratableError>,
+) -> Result<TlsStream, MigratableError> {
+    // The keepalive and user timeout from set_migration_tcp_options() only
+    // detect dead peers: the kernel of a live peer answers them even if the
+    // peer sends no payload. A read and write timeout bounds that case.
+    socket
+        .set_read_timeout(Some(timeout))
+        .and_then(|()| socket.set_write_timeout(Some(timeout)))
+        .map_err(MigratableError::MigrateSocket)?;
+
+    let stream = handshake(socket)?;
+
+    // An established connection can be idle for long, e.g. between pre-copy
+    // iterations, so from now on only the keepalive and user timeout apply.
+    let socket = stream.tcp_stream();
+    socket
+        .set_read_timeout(None)
+        .and_then(|()| socket.set_write_timeout(None))
+        .map_err(MigratableError::MigrateSocket)?;
+
+    Ok(stream)
+}
+
+pub(crate) fn connect_and_setup_socket(
+    destination_url: &str,
+    tls_dir: Option<&Path>,
+) -> Result<SocketStream, MigratableError> {
+    let socket = connect_migration_socket(destination_url, tls_dir)?;
+
+    // A hung destination must not block the sender forever, e.g. while the
+    // source VM is paused for the final transfer.
+    socket
+        .set_read_timeout(Some(UNRESPONSIVE_PEER_TIMEOUT))
+        .and_then(|()| socket.set_write_timeout(Some(UNRESPONSIVE_PEER_TIMEOUT)))
+        .map_err(MigratableError::MigrateSocket)?;
+
+    Ok(socket)
+}
+
+fn connect_migration_socket(
     destination_url: &str,
     tls_dir: Option<&Path>,
 ) -> Result<SocketStream, MigratableError> {
@@ -1106,7 +1175,7 @@ pub(crate) fn send_migration_socket(
             .context("Error connecting to TCP socket")
             .map_err(MigratableError::MigrateSend)?;
 
-        set_tcp_keepalive_and_user_timeout(&socket)
+        set_migration_tcp_options(&socket)
             .context("Failed to set socket options")
             .map_err(MigratableError::MigrateSend)?;
 
@@ -1115,11 +1184,16 @@ pub(crate) fn send_migration_socket(
             // Any error here has to be treated as a programming error.
             let server_name = tcp_address_to_server_name(address)
                 .expect("TCP address should have been validated by the API");
-            TlsStream::new_client(socket, tls_dir, server_name)
-                .map(Box::new)
-                .map(SocketStream::Tls)
-                .context("Error creating TLS migration stream")
-                .map_err(MigratableError::MigrateSend)
+            // Longer than the receiver's CONNECTION_SETUP_TIMEOUT: the receiver
+            // handshakes new connections one at a time, so each foreign
+            // connection can delay this handshake by that much.
+            tls_handshake(socket, UNRESPONSIVE_PEER_TIMEOUT, |socket| {
+                TlsStream::new_client(socket, tls_dir, server_name)
+            })
+            .map(Box::new)
+            .map(SocketStream::Tls)
+            .context("Error creating TLS migration stream")
+            .map_err(MigratableError::MigrateSend)
         } else {
             Ok(SocketStream::Tcp(socket))
         }
@@ -1142,12 +1216,15 @@ pub(crate) fn open_fault_connection(
     destination_url: &str,
     tls_dir: Option<&Path>,
 ) -> Result<SocketStream, MigratableError> {
-    let mut socket = send_migration_socket(destination_url, tls_dir)?;
+    let mut socket = connect_and_setup_socket(destination_url, tls_dir)?;
     ConnectionRole::Fault.write_to(&mut socket)?;
-    // Enable fault request/response round-trips.
+
+    // The destination only sends a request when the guest faults on a page,
+    // which can take arbitrarily long.
     socket
-        .set_nodelay(true)
+        .set_read_timeout(None)
         .map_err(MigratableError::MigrateSocket)?;
+
     Ok(socket)
 }
 
@@ -1210,10 +1287,25 @@ pub(crate) fn send_config(
     socket
         .write_all(&config_data)
         .map_err(MigratableError::MigrateSocket)?;
+
     expect_ok_response(
         socket,
         MigratableError::MigrateSend(anyhow!("Error during config migration")),
     )
+    .inspect_err(|e| {
+        let memory = &config.vm_config.lock().unwrap().memory;
+        let prefault = memory.prefault || memory.zones.iter().flatten().any(|zone| zone.prefault);
+        if prefault
+            && let MigratableError::MigrateSocket(e) = e
+            && matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
+        {
+            warn!(
+                "Timed out ({}s) waiting for the destination to apply the config, likely prefaulting {} GiB of guest memory took unexpectedly long",
+                UNRESPONSIVE_PEER_TIMEOUT.as_secs(),
+                memory.total_size() >> 30
+            );
+        }
+    })
 }
 
 /// Serialize and send the VM snapshot payload.
@@ -1234,6 +1326,59 @@ pub(crate) fn send_state(
     )
 }
 
+/// Buffer to significantly speed up transmission of scattered memory ranges.
+struct TransmissionBuffer {
+    buffer: Vec<u8>,
+    filled: usize,
+}
+
+impl Default for TransmissionBuffer {
+    fn default() -> Self {
+        Self {
+            buffer: vec![0; Self::SIZE],
+            filled: 0,
+        }
+    }
+}
+
+impl TransmissionBuffer {
+    /// Spreads the fixed cost of a write (syscall, TLS record) over many
+    /// pages. A multiple of the 16 KiB TLS record, so it fills whole records.
+    const SIZE: usize = 64 /* KiB */ << 10;
+
+    /// Reserves `len` bytes, sending what is collected if they do not fit.
+    fn reserve(
+        &mut self,
+        socket: &mut SocketStream,
+        len: usize,
+    ) -> Result<&mut [u8], MigratableError> {
+        assert!(len <= Self::SIZE);
+
+        if self.filled + len > Self::SIZE {
+            self.flush(socket)?;
+        }
+
+        let start = self.filled;
+        self.filled += len;
+        Ok(&mut self.buffer[start..self.filled])
+    }
+
+    fn push(&mut self, socket: &mut SocketStream, bytes: &[u8]) -> Result<(), MigratableError> {
+        for chunk in bytes.chunks(Self::SIZE) {
+            self.reserve(socket, chunk.len())?.copy_from_slice(chunk);
+        }
+
+        Ok(())
+    }
+
+    fn flush(&mut self, socket: &mut SocketStream) -> Result<(), MigratableError> {
+        let filled = mem::take(&mut self.filled);
+        socket
+            .write_all(&self.buffer[..filled])
+            .map_err(MigratableError::MigrateSocket)
+    }
+}
+
 /// Transmits the given [`MemoryRangeTable`] and the corresponding guest memory
 /// content over the wire if there is at least one range.
 ///
@@ -1244,47 +1389,52 @@ pub(crate) fn send_state(
 /// In case the migration is cancelled, this shortcuts the transfer.
 pub(crate) fn send_memory_ranges(
     guest_memory: &GuestMemoryAtomic<GuestMemoryMmap>,
-    ranges: &MemoryRangeTable,
+    range_table: &MemoryRangeTable,
     socket: &mut SocketStream,
     cancel_migration: &AtomicBool,
 ) -> Result<(), MigratableError> {
-    if ranges.ranges().is_empty() {
+    if range_table.ranges().is_empty() {
         return Ok(());
     }
 
-    // Send the memory table
-    Request::memory(ranges.length()).write_to(socket)?;
-    ranges.write_to(socket)?;
+    let mut tx_buffer = TransmissionBuffer::default();
+    tx_buffer.push(socket, Request::memory(range_table.length()).as_bytes())?;
+    tx_buffer.push(socket, range_table.as_bytes())?;
 
-    // And then the memory itself
     let mem = guest_memory.memory();
-    for range in ranges.ranges() {
-        let mut offset: u64 = 0;
-        // Here we are manually handling the retry in case we can't read the
-        // whole region at once because we can't use the implementation
-        // from vm-memory::GuestMemory of write_all_to() as it is not
-        // following the correct behavior. For more info about this issue
-        // see: https://github.com/rust-vmm/vm-memory/issues/174
-        loop {
-            if cancel_migration.load(Ordering::Acquire) {
-                return Err(MigratableError::Cancelled);
-            }
+    for range in range_table.ranges() {
+        if cancel_migration.load(Ordering::Acquire) {
+            return Err(MigratableError::Cancelled);
+        }
 
-            let bytes_written = mem
-                .write_volatile_to(
-                    GuestAddress(range.gpa + offset),
-                    socket,
-                    (range.length - offset) as usize,
-                )
-                .context("Error transferring memory to socket")
+        if range.length >= TransmissionBuffer::SIZE as u64 {
+            tx_buffer.flush(socket)?;
+
+            let mut offset = 0;
+            while offset < range.length {
+                if cancel_migration.load(Ordering::Acquire) {
+                    return Err(MigratableError::Cancelled);
+                }
+
+                let bytes_written = mem
+                    .write_volatile_to(
+                        GuestAddress(range.gpa + offset),
+                        socket,
+                        (range.length - offset) as usize,
+                    )
+                    .context("Error transferring memory to socket")
+                    .map_err(MigratableError::MigrateSend)?;
+                offset += bytes_written as u64;
+            }
+        } else {
+            let target = tx_buffer.reserve(socket, range.length as usize)?;
+            mem.read_slice(target, GuestAddress(range.gpa))
+                .context("Error accessing guest memory to transfer")
                 .map_err(MigratableError::MigrateSend)?;
-            offset += bytes_written as u64;
-
-            if offset == range.length {
-                break;
-            }
         }
     }
+    tx_buffer.flush(socket)?;
+
     expect_ok_response(
         socket,
         MigratableError::MigrateSend(anyhow!("Error during dirty memory migration")),
@@ -1341,7 +1491,15 @@ pub(crate) fn receive_memory_ranges(
 
 #[cfg(test)]
 mod tests {
-    use super::tcp_address_to_server_name;
+    use std::net::{TcpListener, TcpStream};
+    use std::path::Path;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    use vm_migration::tls::TlsStream;
+
+    use super::{tcp_address_to_server_name, tls_handshake};
 
     #[test]
     fn test_tcp_address_to_server_name() {
@@ -1411,5 +1569,30 @@ mod tests {
                 .to_string(),
             "Invalid TCP port: 99999"
         );
+    }
+
+    // A peer that accepts the connection but never answers must not block the
+    // TLS handshake forever.
+    #[test]
+    fn test_tls_handshake_with_silent_peer_times_out() {
+        const TIMEOUT: Duration = Duration::from_millis(100);
+
+        // The kernel accepts the connection, but nobody answers.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let tls_dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../test_data/tls"));
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = tls_handshake(socket, TIMEOUT, |socket| {
+                TlsStream::new_client(socket, tls_dir, "localhost")
+            });
+            tx.send(result.is_err())
+        });
+
+        // The handshake fails instead of blocking.
+        let failed = rx
+            .recv_timeout(TIMEOUT * 10)
+            .expect("the handshake should time out");
+        assert!(failed);
     }
 }

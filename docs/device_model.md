@@ -39,6 +39,23 @@ PL011 UART device. The related command line for AArch64 is `console=ttyAMA0`.
 This device is always built-in, and it is disabled by default. It can be
 enabled with the `--serial` option, as long as its parameter is not `off`.
 
+The `--serial` parameter selects where the port is connected. Besides `off`,
+`null`, `tty`, `pty`, and `file=<path>`, the port can be exposed on a UNIX
+socket with `socket=<path>` or on a TCP listener with `tcp=<loopback_ip>:<port>`.
+The TCP backend only listens for incoming connections on loopback addresses,
+specified as IPv4 or IPv6 literals such as `127.0.0.1:4444` or `[::1]:4444`.
+Hostnames and port zero are not accepted. It does not connect out. Listening is the default
+and can be selected explicitly with `server=on`.
+Setting `server=off` is rejected because TCP client mode is not supported.
+It serves one client at a time and buffers output until a client connects.
+It accepts another client only after the current client disconnects.
+Boot does not wait for a client to connect. The same backends and options apply
+to the `virtio-console` device through the `--console` parameter.
+
+TCP console live migration requires the listener address to be available on the
+destination. Migration on the same host cannot reuse the address bound by the source.
+Overriding the destination console address is not currently supported.
+
 ### RTC/CMOS
 
 For environments such as Windows or EFI which cannot rely on KVM clock, the
@@ -116,9 +133,13 @@ regardless of the backing storage. It applies to every image format backend and
 must be a power of 2 between 512 and 64KiB.
 
 With buffered I/O the host page cache absorbs any alignment difference. Under
-`direct=on` a value below the backing block size is not supported, because the
-sub block writes it produces need a read modify write serialized against
-concurrent requests, which the block layer does not do.
+`direct=on`, overrides below the backing block size are rejected for writable
+disks and for read-only raw and fixed VHD disks.
+
+Raw and fixed VHD data requests under `direct=on` must have offsets and total
+lengths aligned to the backing file's direct I/O requirement. Unaligned requests
+return a virtio-block I/O error, including reads from read-only disks. Unaligned
+guest memory buffers are handled with an aligned memory buffer.
 
 ### virtio-console
 

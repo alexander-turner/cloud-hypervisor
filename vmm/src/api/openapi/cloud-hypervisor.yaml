@@ -936,6 +936,25 @@ components:
       enum: ["Vm", "Vcpu", "Off"]
       default: "Vm"
 
+    CpuProfileConfig:
+      description: >-
+        CPU profile. File selects a JSON profile by path and is supported
+        on x86-64 with KVM. Other platforms support Host only.
+      default: "Host"
+      oneOf:
+        - type: string
+          enum: ["Host"]
+        - type: object
+          required: ["File"]
+          additionalProperties: false
+          properties:
+            File:
+              type: string
+              description: >-
+                Path to a JSON CPU profile on the VMM host. The file must
+                remain available with unchanged contents for reboot and
+                restore, including at a migration destination.
+
     CpusConfig:
       required:
         - boot_vcpus
@@ -966,7 +985,45 @@ components:
           $ref: "#/components/schemas/CpuFeatures"
         core_scheduling:
           $ref: "#/components/schemas/CoreSchedulingMode"
+        profile:
+          $ref: "#/components/schemas/CpuProfileConfig"
+        x-cpuid-overrides:
+          description: >
+            Experimental x86-64 common CPUID register overrides, applied in
+            order after the selected CPU profile and before per-vCPU
+            adjustments. The caller must ensure host compatibility.
+          type: array
+          default: []
+          items:
+            $ref: "#/components/schemas/CpuidOverride"
 
+    CpuidValue:
+      description: Unsigned 32-bit value encoded as a 0x-prefixed hex string.
+      type: string
+      pattern: '^0x[0-9a-fA-F]{1,8}$'
+
+    CpuidOverride:
+      type: object
+      required:
+        - leaf
+        - subleaf
+        - eax
+        - ebx
+        - ecx
+        - edx
+      properties:
+        leaf:
+          $ref: "#/components/schemas/CpuidValue"
+        subleaf:
+          $ref: "#/components/schemas/CpuidValue"
+        eax:
+          $ref: "#/components/schemas/CpuidValue"
+        ebx:
+          $ref: "#/components/schemas/CpuidValue"
+        ecx:
+          $ref: "#/components/schemas/CpuidValue"
+        edx:
+          $ref: "#/components/schemas/CpuidValue"
 
     PciSegmentConfig:
       required:
@@ -1005,14 +1062,8 @@ components:
           format: uint8
         system_serial_number:
           type: string
-        serial_number:
-          type: string
-          deprecated: true
         system_uuid:
           type: string
-        uuid:
-          type: string
-          deprecated: true
         oem_strings:
           type: array
           items:
@@ -1029,9 +1080,6 @@ components:
           type: string
         chassis_asset_tag:
           type: string
-        tdx:
-          type: boolean
-          default: false
         sev_snp:
           type: boolean
           default: false
@@ -1217,6 +1265,7 @@ components:
           $ref: "#/components/schemas/IommuType"
         num_queues:
           type: integer
+          format: uint16
           default: 1
         queue_size:
           type: integer
@@ -1280,6 +1329,7 @@ components:
           $ref: "#/components/schemas/IommuType"
         num_queues:
           type: integer
+          format: uint16
           default: 2
         queue_size:
           type: integer
@@ -1385,6 +1435,7 @@ components:
           type: string
         num_queues:
           type: integer
+          format: uint16
           default: 1
         queue_size:
           type: integer
@@ -1450,7 +1501,26 @@ components:
 
     ConsoleMode:
       type: string
-      enum: ["Off", "Pty", "Tty", "File", "Socket", "Null"]
+      enum: ["Off", "Pty", "Tty", "File", "Socket", "Tcp", "Null"]
+
+    TcpConsoleConfig:
+      required:
+        - address
+      type: object
+      additionalProperties: false
+      properties:
+        address:
+          type: string
+          description: |
+            Loopback IPv4 or IPv6 literal and a nonzero port.
+            IPv6 addresses must be enclosed in brackets.
+            Hostnames are not accepted.
+          example: "127.0.0.1:4444"
+        server:
+          type: boolean
+          default: true
+          enum: [true]
+          description: Only server mode is supported.
 
     ConsoleConfig:
       required:
@@ -1461,6 +1531,8 @@ components:
           type: string
         socket:
           type: string
+        tcp:
+          $ref: "#/components/schemas/TcpConsoleConfig"
         mode:
           $ref: "#/components/schemas/ConsoleMode"
         iommu:
@@ -1483,6 +1555,8 @@ components:
           type: string
         socket:
           type: string
+        tcp:
+          $ref: "#/components/schemas/TcpConsoleConfig"
         mode:
           $ref: "#/components/schemas/ConsoleMode"
 
@@ -1561,6 +1635,7 @@ components:
           type: string
         num_queues:
           type: integer
+          format: uint16
           default: 1
         iommu:
           $ref: "#/components/schemas/IommuType"
@@ -1730,10 +1805,17 @@ components:
             Directory containing the TLS server certificate (server-cert.pem), the TLS
             server key (server-key.pem), and the client TLS root CA certificate (ca-cert.pem).
             TLS is only supported with tcp:<host>:<port> receiver URLs.
+            Recommended for all TCP migrations. Omitting it is only intended for
+            development and testing, as TCP migration is then unencrypted and
+            unauthenticated.
         zone_updates:
           type: array
           items:
             $ref: "#/components/schemas/VmMemoryZoneUpdateData"
+        background_fetch_pages:
+          type: boolean
+          default: true
+          description: Enable the background thread for faulting all remaining pages.
 
     MigrationMode:
       type: string
@@ -1822,6 +1904,9 @@ components:
             Directory containing the TLS root CA certificate (ca-cert.pem), the TLS client
             certificate (client-cert.pem), and TLS client key (client-key.pem).
             TLS is only supported with tcp:<host>:<port> destination URLs.
+            Recommended for all TCP migrations. Omitting it is only intended for
+            development and testing, as TCP migration is then unencrypted and
+            unauthenticated.
         memory_mode:
           $ref: "#/components/schemas/MigrationMode"
 

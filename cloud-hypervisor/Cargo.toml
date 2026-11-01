@@ -8,7 +8,7 @@ homepage = "https://github.com/cloud-hypervisor/cloud-hypervisor"
 license = "Apache-2.0 AND BSD-3-Clause"
 name = "cloud-hypervisor"
 rust-version.workspace = true
-version = "54.0.0"
+version = "55.0.0"
 
 [dependencies]
 api_client = { path = "../api_client" }
@@ -55,7 +55,6 @@ kvm = ["vmm/kvm"]
 mshv = ["vmm/mshv"]
 pvmemcontrol = ["vmm/pvmemcontrol"]
 sev_snp = ["igvm", "vmm/sev_snp"]
-tdx = ["vmm/tdx"]
 tracing = ["tracer/tracing", "vmm/tracing"]
 
 [lints]

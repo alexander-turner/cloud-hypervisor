@@ -4,9 +4,6 @@
 //
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
-use std::io;
-use std::os::unix::io::AsRawFd;
-
 use vmm_sys_util::eventfd::EventFd;
 
 use crate::async_io::{
@@ -18,14 +15,14 @@ use crate::{AlignedFile, is_block_device};
 pub(crate) struct RawSync {
     raw_file: AlignedFile,
     completions: CompletionCommon,
-    alignment: u64,
+    alignment: Option<u64>,
     is_block_device: bool,
 }
 
 impl RawSync {
     pub(crate) fn new(raw_file: AlignedFile) -> Self {
-        let is_block_device = is_block_device(raw_file.as_raw_fd());
-        let alignment = raw_file.alignment() as u64;
+        let is_block_device = is_block_device(raw_file.file());
+        let alignment = raw_file.alignment().map(|alignment| alignment as u64);
         RawSync {
             raw_file,
             completions: CompletionCommon::new(),
@@ -40,7 +37,7 @@ impl AsyncIo for RawSync {
         self.completions.notifier()
     }
 
-    fn alignment(&self) -> u64 {
+    fn alignment(&self) -> Option<u64> {
         self.alignment
     }
 
@@ -67,15 +64,11 @@ impl AsyncIo for RawSync {
     }
 
     fn fsync(&mut self, user_data: Option<u64>) -> AsyncIoResult<()> {
-        // SAFETY: FFI call
-        let result = unsafe { libc::fsync(self.raw_file.as_raw_fd() as libc::c_int) };
-        if result < 0 {
-            return Err(AsyncIoError::Fsync(io::Error::last_os_error()));
-        }
+        self.raw_file.sync_all().map_err(AsyncIoError::Fsync)?;
 
         if let Some(user_data) = user_data {
             self.completions
-                .complete(AsyncIoCompletion::new(user_data, result, None));
+                .complete(AsyncIoCompletion::new(user_data, 0, None));
         }
 
         Ok(())
@@ -86,16 +79,26 @@ impl AsyncIo for RawSync {
     }
 
     fn punch_hole(&mut self, offset: u64, length: u64, user_data: u64) -> AsyncIoResult<()> {
-        punch_hole(&mut self.raw_file, self.is_block_device, offset, length)
-            .map_err(AsyncIoError::PunchHole)?;
+        punch_hole(
+            self.raw_file.file_mut(),
+            self.is_block_device,
+            offset,
+            length,
+        )
+        .map_err(AsyncIoError::PunchHole)?;
         self.completions
             .complete(AsyncIoCompletion::new(user_data, 0, None));
         Ok(())
     }
 
     fn write_zeroes(&mut self, offset: u64, length: u64, user_data: u64) -> AsyncIoResult<()> {
-        write_zeroes(&mut self.raw_file, self.is_block_device, offset, length)
-            .map_err(AsyncIoError::WriteZeroes)?;
+        write_zeroes(
+            self.raw_file.file_mut(),
+            self.is_block_device,
+            offset,
+            length,
+        )
+        .map_err(AsyncIoError::WriteZeroes)?;
         self.completions
             .complete(AsyncIoCompletion::new(user_data, 0, None));
         Ok(())

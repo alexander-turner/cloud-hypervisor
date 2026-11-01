@@ -19,7 +19,6 @@
 //! - x86_64
 //! - arm64
 //! - riscv64 (experimental)
-//!
 
 /// Architecture specific definitions
 #[macro_use]
@@ -216,6 +215,7 @@ impl ClockData {
     /// Returns the clock with `CLOCK_REALTIME` filled from the host wall clock
     /// when absent, so a later restore can advance the guest to current wall
     /// time. No-op for backends without a realtime field (e.g. MSHV).
+    #[must_use]
     pub fn with_realtime_filled(mut self) -> Self {
         if !self.has_realtime() {
             self.set_realtime(SystemTime::now());
@@ -261,8 +261,6 @@ pub enum ClockRestoreMode {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct HypervisorVmConfig {
-    #[cfg(feature = "tdx")]
-    pub tdx_enabled: bool,
     #[cfg(feature = "sev_snp")]
     pub sev_snp_enabled: bool,
     #[cfg(feature = "sev_snp")]
