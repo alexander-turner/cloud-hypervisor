@@ -7,7 +7,6 @@
 use std::sync::{Arc, Mutex};
 use std::{mem, result};
 
-use byteorder::{ByteOrder, LittleEndian};
 use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -448,7 +447,11 @@ fn encode_32_bits_bar_size(bar_size: u32) -> Option<u32> {
 
 fn decode_32_bits_bar_size(bar_size: u32) -> Option<u32> {
     if bar_size > 0 {
-        return Some(!bar_size + 1);
+        let size = !bar_size + 1;
+        // PCI specification requires BAR sizes to be non-zero powers of two.
+        if size.is_power_of_two() {
+            return Some(size);
+        }
     }
     None
 }
@@ -466,7 +469,11 @@ fn encode_64_bits_bar_size(bar_size: u64) -> Option<(u32, u32)> {
 fn decode_64_bits_bar_size(bar_size_hi: u32, bar_size_lo: u32) -> Option<u64> {
     let bar_size: u64 = ((bar_size_hi as u64) << 32) | (bar_size_lo as u64);
     if bar_size > 0 {
-        return Some(!bar_size + 1);
+        let size = !bar_size + 1;
+        // PCI specification requires BAR sizes to be non-zero powers of two.
+        if size.is_power_of_two() {
+            return Some(size);
+        }
     }
     None
 }
@@ -627,10 +634,6 @@ pub enum Error {
     CapabilityEmpty,
     #[error("Capability of size {0} doesn't fit")]
     CapabilitySpaceFull(usize),
-    #[error("Failed to decode 32-bit BAR size")]
-    Decode32BarSize,
-    #[error("Failed to decode 64-bit BAR size")]
-    Decode64BarSize,
     #[error("Failed to encode 32-bit BAR size")]
     Encode32BarSize,
     #[error("Failed to encode 64-bit BAR size")]
@@ -1061,16 +1064,22 @@ impl PciConfiguration {
         if let Some(msix_cap_reg_idx) = self.msix_cap_reg_idx
             && let Some(msix_config) = &self.msix_config
         {
-            if msix_cap_reg_idx == reg_idx && offset == 2 && data.len() == 2 {
+            if msix_cap_reg_idx == reg_idx
+                && offset == 2
+                && let Ok(data) = <[u8; 2]>::try_from(data)
+            {
                 msix_config
                     .lock()
                     .unwrap()
-                    .set_msg_ctl(LittleEndian::read_u16(data));
-            } else if msix_cap_reg_idx == reg_idx && offset == 0 && data.len() == 4 {
+                    .set_msg_ctl(u16::from_le_bytes(data));
+            } else if msix_cap_reg_idx == reg_idx
+                && offset == 0
+                && let Ok(data) = <[u8; 4]>::try_from(data)
+            {
                 msix_config
                     .lock()
                     .unwrap()
-                    .set_msg_ctl((LittleEndian::read_u32(data) >> 16) as u16);
+                    .set_msg_ctl((u32::from_le_bytes(data) >> 16) as u16);
             }
         }
 
@@ -1080,7 +1089,10 @@ impl PciConfiguration {
                 reg_idx * 4 + offset as usize,
                 u16::from(data[0]) | (u16::from(data[1]) << 8),
             ),
-            4 => self.write_reg(reg_idx, LittleEndian::read_u32(data)),
+            4 => self.write_reg(
+                reg_idx,
+                u32::from_le_bytes(data.try_into().expect("data should be 4 bytes")),
+            ),
             _ => (),
         }
 
@@ -1117,11 +1129,11 @@ impl PciConfiguration {
         reg_idx: usize,
         data: &[u8],
     ) -> Option<BarReprogrammingParams> {
-        if data.len() != 4 {
+        let Ok(data) = <[u8; 4]>::try_from(data) else {
             return None;
-        }
+        };
 
-        let value = LittleEndian::read_u32(data);
+        let value = u32::from_le_bytes(data);
 
         // Ignore the case where the BAR size is being asked for.
         if self.is_bar_size_probe(reg_idx, value) {
@@ -1153,11 +1165,8 @@ impl PciConfiguration {
                 );
                 let old_base = u64::from(self.bars[bar_idx].addr & mask);
                 let new_base = u64::from(value & mask);
-                let len = u64::from(
-                    decode_32_bits_bar_size(self.bars[bar_idx].size)
-                        .ok_or(Error::Decode32BarSize)
-                        .unwrap(),
-                );
+                let decoded_len = decode_32_bits_bar_size(self.bars[bar_idx].size)?;
+                let len = u64::from(decoded_len);
                 let region_type = bar_type;
 
                 self.bars[bar_idx].addr = value;
@@ -1170,6 +1179,8 @@ impl PciConfiguration {
                     region_type,
                 });
             } else if (bar_idx > 0)
+                && self.bars[bar_idx].used
+                && self.bars[bar_idx - 1].r#type == Some(PciBarRegionType::Memory64BitRegion)
                 && ((self.registers[reg_idx - 1] & self.writable_bits[reg_idx - 1])
                     != (self.bars[bar_idx - 1].addr & self.writable_bits[reg_idx - 1])
                     || (value & mask) != (self.bars[bar_idx].addr & mask))
@@ -1183,9 +1194,7 @@ impl PciConfiguration {
                 let new_base = (u64::from(value & mask) << 32)
                     | u64::from(self.registers[reg_idx - 1] & self.writable_bits[reg_idx - 1]);
                 let len =
-                    decode_64_bits_bar_size(self.bars[bar_idx].size, self.bars[bar_idx - 1].size)
-                        .ok_or(Error::Decode64BarSize)
-                        .unwrap();
+                    decode_64_bits_bar_size(self.bars[bar_idx].size, self.bars[bar_idx - 1].size)?;
                 let region_type = PciBarRegionType::Memory64BitRegion;
 
                 self.bars[bar_idx].addr = value;
@@ -1212,11 +1221,8 @@ impl PciConfiguration {
             );
             let old_base = u64::from(self.rom_bar_addr & mask);
             let new_base = u64::from(value & mask);
-            let len = u64::from(
-                decode_32_bits_bar_size(self.rom_bar_size)
-                    .ok_or(Error::Decode32BarSize)
-                    .unwrap(),
-            );
+            let decoded_len = decode_32_bits_bar_size(self.rom_bar_size)?;
+            let len = u64::from(decoded_len);
             let region_type = PciBarRegionType::Memory32BitRegion;
 
             self.rom_bar_addr = value;
@@ -1904,5 +1910,58 @@ mod tests {
         });
 
         assert!(reloc_config(Some(state)).pending_bar_reprogram.is_empty());
+    }
+
+    #[test]
+    fn decode_bar_size_requires_power_of_two() {
+        assert_eq!(decode_32_bits_bar_size(0xfff8_0000), Some(0x80000));
+        assert_eq!(decode_32_bits_bar_size(0xffff_fffa), None);
+        assert_eq!(
+            decode_64_bits_bar_size(0xffff_ffff, 0xfff8_0000),
+            Some(0x80000)
+        );
+        assert_eq!(decode_64_bits_bar_size(0xffff_ffff, 0xffff_fffa), None);
+    }
+
+    #[test]
+    fn unused_bar_write_does_not_fabricate_64bit_bar_reprogram() {
+        let mut cfg = PciConfiguration::new(
+            0x1234,
+            0x5678,
+            0x1,
+            PciClassCode::MultimediaController,
+            &PciMultimediaSubclass::AudioController,
+            None,
+            PciHeaderType::Device,
+            0xABCD,
+            0x2468,
+            None,
+            None,
+        );
+        let bar_addr = 0xc000_0000;
+        let bar = PciBarConfiguration::new(
+            0,
+            0x80000,
+            PciBarRegionType::Memory32BitRegion,
+            PciBarPrefetchable::NotPrefetchable,
+        )
+        .set_address(bar_addr);
+
+        cfg.add_pci_bar(&bar).unwrap();
+        // Enable memory space decoding.
+        cfg.write_reg(COMMAND_REG, COMMAND_REG_MEMORY_SPACE_MASK);
+
+        // Step 1: Probe 32-bit BAR 0 size by writing all ones.
+        cfg.write_config_register(BAR0_REG, 0, &0xffff_ffffu32.to_le_bytes());
+
+        // Step 2: Write 0 to unused BAR 1.
+        let reprogram = cfg.write_config_register(BAR0_REG + 1, 0, &0u32.to_le_bytes());
+
+        // Must not fabricate 64-bit BAR reprogramming on an unused slot.
+        assert!(
+            reprogram.is_empty(),
+            "Must not fabricate phantom 64-bit BAR reprogramming!"
+        );
+        assert_eq!(cfg.get_bar_addr(0), bar_addr);
     }
 }

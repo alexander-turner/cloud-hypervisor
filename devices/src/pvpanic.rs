@@ -7,7 +7,6 @@ use std::any::Any;
 use std::sync::{Arc, Barrier};
 use std::{io, result};
 
-use anyhow::anyhow;
 use event_monitor::event;
 use log::{debug, info};
 use pci::{
@@ -24,6 +23,8 @@ use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottabl
 
 const PVPANIC_VENDOR_ID: u16 = 0x1b36;
 const PVPANIC_DEVICE_ID: u16 = 0x0011;
+const PVPANIC_SUBSYSTEM_VENDOR_ID: u16 = 0x1af4;
+const PVPANIC_SUBSYSTEM_ID: u16 = 0x1100;
 
 pub const PVPANIC_DEVICE_MMIO_SIZE: u64 = 0x2;
 pub const PVPANIC_DEVICE_MMIO_ALIGNMENT: u64 = 0x10;
@@ -34,9 +35,9 @@ const PVPANIC_CRASH_LOADED: u8 = 1 << 1;
 #[derive(Debug, Error)]
 pub enum PvPanicError {
     #[error("Failed creating PvPanicDevice")]
-    CreatePvPanicDevice(#[source] anyhow::Error),
+    CreatePvPanicDevice(#[source] MigratableError),
     #[error("Failed to retrieve PciConfigurationState")]
-    RetrievePciConfigurationState(#[source] anyhow::Error),
+    RetrievePciConfigurationState(#[source] MigratableError),
 }
 
 #[derive(Copy, Clone)]
@@ -69,11 +70,7 @@ pub struct PvPanicDeviceState {
 impl PvPanicDevice {
     pub fn new(id: String, bdf: PciBdf, snapshot: Option<&Snapshot>) -> Result<Self, PvPanicError> {
         let pci_configuration_state = vm_migration::state_from_id(snapshot, PCI_CONFIGURATION_ID)
-            .map_err(|e| {
-            PvPanicError::RetrievePciConfigurationState(anyhow!(
-                "Failed to get PciConfigurationState from Snapshot: {e}"
-            ))
-        })?;
+            .map_err(PvPanicError::RetrievePciConfigurationState)?;
 
         let mut configuration = PciConfiguration::new(
             PVPANIC_VENDOR_ID,
@@ -83,8 +80,8 @@ impl PvPanicDevice {
             &PvPanicSubclass::Other,
             None,
             PciHeaderType::Device,
-            0,
-            0,
+            PVPANIC_SUBSYSTEM_VENDOR_ID,
+            PVPANIC_SUBSYSTEM_ID,
             None,
             pci_configuration_state,
         );
@@ -100,11 +97,7 @@ impl PvPanicDevice {
             .as_ref()
             .map(|s| s.to_state())
             .transpose()
-            .map_err(|e| {
-                PvPanicError::CreatePvPanicDevice(anyhow!(
-                    "Failed to get PvPanicDeviceState from Snapshot: {e}"
-                ))
-            })?;
+            .map_err(PvPanicError::CreatePvPanicDevice)?;
         let events = if let Some(state) = state {
             state.events
         } else {
@@ -145,6 +138,10 @@ impl BusDevice for PvPanicDevice {
     }
 
     fn write(&mut self, _base: u64, _offset: u64, data: &[u8]) -> Option<Arc<Barrier>> {
+        if data.len() != 1 {
+            debug!("Invalid sized write of pvpanic register: {}", data.len());
+            return None;
+        }
         let event = self.event_to_string(data[0]);
         info!("pvpanic got guest event {event}");
         event!("guest", "panic", "event", &event);
@@ -234,6 +231,10 @@ impl PciDevice for PvPanicDevice {
     }
 
     fn read_bar(&mut self, _base: u64, _offset: u64, data: &mut [u8]) {
+        if data.len() != 1 {
+            debug!("Invalid sized read of pvpanic register: {}", data.len());
+            return;
+        }
         data[0] = self.events;
     }
 

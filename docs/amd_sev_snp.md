@@ -24,7 +24,6 @@ Change `mshv` to `kvm` for the KVM backend. You can enable both at the same
 time.
 
 **Note**
-Please note that `sev_snp` cannot be enabled in conjunction with the `tdx` feature flag.
 
 SEV-SNP is also supported on KVM with an IGVM stage0 image and a guest kernel
 provided through `fw_cfg`. Build that configuration with:
@@ -47,6 +46,6 @@ For more information related to Microsoft Hypervisor, please see [mshv.md](mshv.
 
 **Limitations**
 Note that Cloud Hypervisor does not support the following features with SEV-SNP:
-- Memory & CPU hotplug
+- Memory hotplug
 - Huge Pages (HugeTLB)
 - Virtual IOMMU

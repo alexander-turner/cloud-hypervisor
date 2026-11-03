@@ -85,7 +85,10 @@ pub enum OptionParserError {
 }
 type OptionParserResult<T> = result::Result<T, OptionParserError>;
 
-fn split_commas(s: &str) -> OptionParserResult<Vec<String>> {
+/// Splits a comma-separated list, keeping quoted or bracketed values together.
+///
+/// Returns an error if quotes or brackets are unbalanced.
+pub fn split_commas(s: &str) -> OptionParserResult<Vec<String>> {
     let mut list: Vec<String> = Vec::new();
     let mut opened_brackets = 0u64;
     let mut in_quotes = false;
@@ -564,25 +567,22 @@ pub enum StringListParseError {
 }
 
 fn dequote(s: &str) -> String {
-    let mut prev_byte = b'\0';
+    let mut prev_char = '\0';
     let mut in_quotes = false;
-    let mut out: Vec<u8> = vec![];
-    for i in s.bytes() {
-        if i == b'"' {
-            if prev_byte == b'"' && !in_quotes {
-                out.push(b'"');
+    let mut out = String::new();
+    for c in s.chars() {
+        if c == '"' {
+            if prev_char == '"' && !in_quotes {
+                out.push('"');
             }
             in_quotes = !in_quotes;
         } else {
-            out.push(i);
+            out.push(c);
         }
-        prev_byte = i;
+        prev_char = c;
     }
     assert!(!in_quotes, "split_commas didn't reject unbalanced quotes");
-    // SAFETY: the non-ASCII bytes in the output are the same
-    // and in the same order as those in the input, so if the
-    // input is valid UTF-8 the output will be as well.
-    unsafe { String::from_utf8_unchecked(out) }
+    out
 }
 
 impl<T> Parseable for T

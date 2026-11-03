@@ -4,6 +4,7 @@
 //
 
 #![expect(clippy::undocumented_unsafe_blocks)]
+#![expect(clippy::panic, reason = "test code")]
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -1284,26 +1285,31 @@ impl Guest {
         Self::new_from_ip_range(disk_config, "192.168", next_guest_id())
     }
 
+    #[must_use]
     pub fn with_cpu(mut self, count: u32) -> Self {
         self.num_cpu = count;
         self
     }
 
+    #[must_use]
     pub fn with_memory(mut self, mem_size: &str) -> Self {
         self.mem_size_str = mem_size.to_string();
         self
     }
 
+    #[must_use]
     pub fn with_nested(mut self, nested: bool) -> Self {
         self.nested = nested;
         self
     }
 
+    #[must_use]
     pub fn with_kernel_path(mut self, kernel_path: &str) -> Self {
         self.kernel_path = Some(kernel_path.to_string());
         self
     }
 
+    #[must_use]
     pub fn with_kernel(mut self, kernel: String) -> Self {
         self.kernel_path = Some(kernel);
         self
@@ -2095,24 +2101,6 @@ impl<'a> GuestCommand<'a> {
         self.default_cloudinit_disk()
     }
 
-    // Needed for when running old version as part of live upgrade
-    pub fn legacy_default_disks(&mut self) -> &mut Self {
-        let mut disks = vec![
-            "--disk".to_string(),
-            format!(
-                "path={}",
-                self.guest
-                    .disk_config
-                    .disk(DiskType::OperatingSystem)
-                    .unwrap(),
-            ),
-        ];
-        if let Some(cloud_init) = self.guest.disk_config.disk(DiskType::CloudInit) {
-            disks.push(format!("path={cloud_init}"));
-        }
-        self.args(disks)
-    }
-
     pub fn default_cloudinit_disk(&mut self) -> &mut Self {
         if let Some(cloud_init) = self.guest.disk_config.disk(DiskType::CloudInit) {
             self.args([
@@ -2134,8 +2122,9 @@ impl<'a> GuestCommand<'a> {
             } else {
                 "hvc0"
             };
-            let igvm = direct_igvm_boot_path(Some(console_str))
-                .expect("IGVM boot file not found for console type: {console_str}");
+            let igvm = direct_igvm_boot_path(Some(console_str)).unwrap_or_else(|| {
+                panic!("IGVM boot file not found for console type: {console_str}")
+            });
             self.command.args([
                 "--igvm",
                 igvm.to_str().expect("IGVM path is not valid UTF-8"),
@@ -2445,16 +2434,16 @@ fn child_wait_timeout(child: &mut Child, timeout: u64) -> Result<(), WaitTimeout
 
 pub fn measure_virtio_net_throughput(
     test_timeout: u32,
-    queue_pairs: u32,
+    queue_pairs: u16,
     guest: &Guest,
     receive: bool,
     bandwidth: bool,
 ) -> Result<f64, Error> {
-    let default_port = 5201;
+    let default_port: u32 = 5201;
 
     // 1. start the iperf3 server on the guest
     for n in 0..queue_pairs {
-        guest.ssh_command(&format!("iperf3 -s -p {} -D", default_port + n))?;
+        guest.ssh_command(&format!("iperf3 -s -p {} -D", default_port + n as u32))?;
     }
 
     thread::sleep(Duration::new(1, 0));
@@ -2468,7 +2457,7 @@ pub fn measure_virtio_net_throughput(
             "-c",
             &guest.network.guest_ip0,
             "-p",
-            &format!("{}", default_port + n),
+            &format!("{}", default_port + n as u32),
             "-t",
             &format!("{test_timeout}"),
             "-i",
@@ -2666,7 +2655,7 @@ pub fn on_kvm_sev_snp() -> bool {
     sev_snp_direct_kernel().is_some()
 }
 
-// Get the direct igvm boot file path based on the console type
+// Get the stage0 IGVM path or a console-specific Linux IGVM path.
 fn direct_igvm_boot_path(console: Option<&str>) -> Option<PathBuf> {
     // get the default hvc0 igvm file if console string is not passed
     let console_str = console.unwrap_or("hvc0");
@@ -2675,7 +2664,11 @@ fn direct_igvm_boot_path(console: Option<&str>) -> Option<PathBuf> {
         panic!("IGVM console should be hvc0 or ttyS0, got: {console_str}");
     }
 
-    let igvm_filepath = format!("/igvm_files/linux-{console_str}.bin");
+    let igvm_filepath = if on_kvm_sev_snp() {
+        "/igvm_files/stage0.igvm".to_string()
+    } else {
+        format!("/igvm_files/linux-{console_str}.bin")
+    };
     if Path::new(&igvm_filepath).exists() {
         Some(PathBuf::from(igvm_filepath))
     } else {

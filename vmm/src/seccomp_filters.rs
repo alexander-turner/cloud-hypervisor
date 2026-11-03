@@ -8,10 +8,11 @@ use std::env::consts;
 
 use hypervisor::HypervisorType;
 use libc::{
-    BLKIOMIN, BLKIOOPT, BLKPBSZGET, BLKSSZGET, FIOCLEX, FIONBIO, SIOCGIFFLAGS, SIOCGIFHWADDR,
-    SIOCGIFINDEX, SIOCGIFMTU, SIOCSIFADDR, SIOCSIFFLAGS, SIOCSIFHWADDR, SIOCSIFMTU, SIOCSIFNETMASK,
-    TCGETS, TCGETS2, TCSETS, TCSETS2, TIOCGPGRP, TIOCGPTPEER, TIOCGWINSZ, TIOCSCTTY, TIOCSPGRP,
-    TIOCSPTLCK, TUNGETFEATURES, TUNGETIFF, TUNSETIFF, TUNSETOFFLOAD, TUNSETQUEUE, TUNSETVNETHDRSZ,
+    BLKIOMIN, BLKIOOPT, BLKPBSZGET, BLKSSZGET, FICLONERANGE, FIOCLEX, FIONBIO, SIOCGIFFLAGS,
+    SIOCGIFHWADDR, SIOCGIFINDEX, SIOCGIFMTU, SIOCSIFADDR, SIOCSIFFLAGS, SIOCSIFHWADDR, SIOCSIFMTU,
+    SIOCSIFNETMASK, TCGETS, TCGETS2, TCSETS, TCSETS2, TIOCGPGRP, TIOCGPTPEER, TIOCGWINSZ,
+    TIOCSCTTY, TIOCSPGRP, TIOCSPTLCK, TUNGETFEATURES, TUNGETIFF, TUNSETIFF, TUNSETOFFLOAD,
+    TUNSETQUEUE, TUNSETVNETHDRSZ,
 };
 use seccompiler::SeccompCmpOp::{Eq, MaskedEq};
 use seccompiler::{
@@ -30,11 +31,12 @@ use virtio_devices::vdpa::VHOST_VDPA_RESUME;
 
 use crate::userfaultfd::{
     UFFDIO_API, UFFDIO_CONTINUE, UFFDIO_COPY, UFFDIO_POISON, UFFDIO_REGISTER, UFFDIO_WAKE,
-    USERFAULTFD_IOC_NEW,
+    UFFDIO_ZEROPAGE, USERFAULTFD_IOC_NEW,
 };
 
 #[derive(Copy, Clone)]
 pub enum Thread {
+    Main,
     HttpApi,
     #[cfg(feature = "dbus_api")]
     DBusApi,
@@ -139,6 +141,7 @@ mod iommufd {
     pub(super) const IOMMU_HWPT_ALLOC: u64 = 0x3b89;
     pub(super) const IOMMU_GET_HW_INFO: u64 = 0x3b8a;
     pub(super) const IOMMU_HWPT_INVALIDATE: u64 = 0x3b8d;
+    pub(super) const IOMMU_IOAS_MAP_FILE: u64 = 0x3b8f;
     pub(super) const IOMMU_VIOMMU_ALLOC: u64 = 0x3b90;
     pub(super) const IOMMU_VDEVICE_ALLOC: u64 = 0x3b91;
     pub(super) const IOMMU_VEVENTQ_ALLOC: u64 = 0x3b93;
@@ -308,6 +311,7 @@ fn create_vmm_ioctl_seccomp_rule_iommufd() -> Result<Vec<SeccompRule>, BackendEr
         and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_HWPT_ALLOC)?],
         and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_GET_HW_INFO)?],
         and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_HWPT_INVALIDATE)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_IOAS_MAP_FILE)?],
         and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_VIOMMU_ALLOC)?],
         and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_VDEVICE_ALLOC)?],
         and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_VEVENTQ_ALLOC)?],
@@ -350,6 +354,7 @@ fn create_vmm_ioctl_seccomp_rule_common(
         and![Cond::new(1, ArgLen::Dword, Eq, BLKGETSIZE64 as _)?],
         and![Cond::new(1, ArgLen::Dword, Eq, BLKDISCARD as _)?],
         and![Cond::new(1, ArgLen::Dword, Eq, BLKZEROOUT as _)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, FICLONERANGE as _)?],
         and![Cond::new(1, ArgLen::Dword, Eq, FIOCLEX as _)?],
         and![Cond::new(1, ArgLen::Dword, Eq, FIONBIO as _)?],
         and![Cond::new(1, ArgLen::Dword, Eq, SIOCGIFFLAGS)?],
@@ -454,6 +459,7 @@ fn create_vmm_ioctl_seccomp_rule_common(
         and![Cond::new(1, ArgLen::Dword, Eq, UFFDIO_COPY)?],
         and![Cond::new(1, ArgLen::Dword, Eq, UFFDIO_REGISTER)?],
         and![Cond::new(1, ArgLen::Dword, Eq, UFFDIO_WAKE)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, UFFDIO_ZEROPAGE)?],
         and![Cond::new(1, ArgLen::Dword, Eq, UFFDIO_CONTINUE)?],
         and![Cond::new(1, ArgLen::Dword, Eq, UFFDIO_POISON)?],
         and![Cond::new(1, ArgLen::Dword, Eq, USERFAULTFD_IOC_NEW)?],
@@ -666,6 +672,68 @@ fn pty_foreground_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, Backend
     ])
 }
 
+fn main_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, BackendError> {
+    Ok(vec![
+        (libc::SYS_brk, vec![]),
+        (libc::SYS_clock_gettime, vec![]),
+        (libc::SYS_close, vec![]),
+        (libc::SYS_exit, vec![]),
+        (libc::SYS_exit_group, vec![]),
+        (libc::SYS_fcntl, vec![]),
+        (libc::SYS_fstat, vec![]),
+        (libc::SYS_futex, vec![]),
+        (libc::SYS_getrandom, vec![]),
+        (libc::SYS_landlock_create_ruleset, vec![]),
+        (libc::SYS_landlock_restrict_self, vec![]),
+        (libc::SYS_lseek, vec![]),
+        (libc::SYS_madvise, vec![]),
+        (libc::SYS_mmap, vec![]),
+        (libc::SYS_mprotect, vec![]),
+        (libc::SYS_mremap, vec![]),
+        (libc::SYS_munmap, vec![]),
+        (libc::SYS_newfstatat, vec![]),
+        // Heap profiling writes its report from main during shutdown.
+        #[cfg(feature = "dhat-heap")]
+        (libc::SYS_openat, vec![]),
+        (
+            libc::SYS_prctl,
+            or![
+                and![Cond::new(0, ArgLen::Dword, Eq, libc::PR_GET_NAME as u64)?],
+                and![Cond::new(
+                    0,
+                    ArgLen::Dword,
+                    Eq,
+                    libc::PR_GET_NO_NEW_PRIVS as u64
+                )?],
+                and![
+                    Cond::new(0, ArgLen::Dword, Eq, libc::PR_SET_NO_NEW_PRIVS as u64)?,
+                    Cond::new(1, ArgLen::Dword, Eq, 1)?
+                ],
+            ],
+        ),
+        #[cfg(all(feature = "dhat-heap", target_arch = "x86_64"))]
+        (libc::SYS_readlink, vec![]),
+        #[cfg(all(
+            feature = "dhat-heap",
+            any(target_arch = "aarch64", target_arch = "riscv64")
+        ))]
+        (libc::SYS_readlinkat, vec![]),
+        (libc::SYS_restart_syscall, vec![]),
+        (libc::SYS_rt_sigreturn, vec![]),
+        (libc::SYS_sched_yield, vec![]),
+        (libc::SYS_sigaltstack, vec![]),
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_stat, vec![]),
+        (libc::SYS_statx, vec![]),
+        // HTTP shutdown drops the socket and its lock file on this thread.
+        #[cfg(target_arch = "x86_64")]
+        (libc::SYS_unlink, vec![]),
+        #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+        (libc::SYS_unlinkat, vec![]),
+        (libc::SYS_writev, vec![]),
+    ])
+}
+
 // The filter containing the white listed syscall rules required by the VMM to
 // function.
 fn vmm_thread_rules(
@@ -736,6 +804,7 @@ fn vmm_thread_rules(
         (libc::SYS_madvise, vec![]),
         (libc::SYS_mbind, vec![]),
         (libc::SYS_memfd_create, vec![]),
+        (libc::SYS_mincore, vec![]),
         (libc::SYS_mmap, vec![]),
         (libc::SYS_mprotect, vec![]),
         (libc::SYS_mremap, vec![]),
@@ -883,6 +952,8 @@ fn create_vcpu_ioctl_seccomp_rule_iommufd() -> Result<Vec<SeccompRule>, BackendE
         and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_IOAS_UNMAP)?],
         and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_HWPT_ALLOC)?],
         and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_HWPT_INVALIDATE)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_IOAS_MAP_FILE)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, VFIO_DEVICE_FEATURE)?],
         and![Cond::new(
             1,
             ArgLen::Dword,
@@ -1205,6 +1276,7 @@ fn serial_manager_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, Backend
         (libc::SYS_recvfrom, vec![]),
         (libc::SYS_rt_sigreturn, vec![]),
         (libc::SYS_sendto, vec![]),
+        (libc::SYS_setsockopt, vec![]),
         (libc::SYS_shutdown, vec![]),
         (libc::SYS_sigaltstack, vec![]),
     ])
@@ -1241,6 +1313,7 @@ fn get_seccomp_rules(
 ) -> Result<Vec<(i64, Vec<SeccompRule>)>, BackendError> {
     let mut rules = common_thread_rules()?;
     let specific_rules = match thread_type {
+        Thread::Main => main_thread_rules()?,
         Thread::HttpApi => http_api_thread_rules()?,
         #[cfg(feature = "dbus_api")]
         Thread::DBusApi => dbus_api_thread_rules()?,
@@ -1311,5 +1384,21 @@ pub fn get_seccomp_filter(
         )
         .and_then(|filter| filter.try_into())
         .map_err(Error::Backend),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_serial_manager_has_no_outbound_socket_rules() {
+        let rules = get_seccomp_rules(Thread::SerialManager, None).unwrap();
+        for syscall in [libc::SYS_socket, libc::SYS_connect] {
+            assert!(!rules.iter().any(|(number, _)| *number == syscall));
+        }
+        for syscall in [libc::SYS_accept4, libc::SYS_setsockopt] {
+            assert!(rules.iter().any(|(number, _)| *number == syscall));
+        }
     }
 }

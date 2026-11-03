@@ -11,7 +11,7 @@
 //
 
 use std::any::Any;
-#[cfg(any(feature = "sev_snp", feature = "tdx"))]
+#[cfg(feature = "sev_snp")]
 use std::io;
 use std::result;
 use std::sync::Arc;
@@ -23,6 +23,7 @@ use igvm_defs::IGVM_VHS_SNP_ID_BLOCK;
 #[cfg(feature = "sev_snp")]
 use igvm_defs::SnpPolicy;
 use thiserror::Error;
+use vm_memory::GuestMemoryError;
 use vmm_sys_util::eventfd::EventFd;
 
 #[cfg(target_arch = "x86_64")]
@@ -31,16 +32,12 @@ use crate::ClockData;
 use crate::arch::aarch64::gic::{Vgic, VgicConfig};
 #[cfg(target_arch = "riscv64")]
 use crate::arch::riscv64::aia::{Vaia, VaiaConfig};
-#[cfg(feature = "tdx")]
-use crate::arch::x86::CpuIdEntry;
 #[cfg(target_arch = "x86_64")]
 use crate::arch::x86::VcpuMsrConfigUpdate;
 use crate::cpu::Vcpu;
 use crate::{ClockRestoreMode, ClockState, IoEventAddress, IrqRoutingEntry};
 
-///
 /// I/O events data matches (32 or 64 bits).
-///
 #[derive(Debug)]
 pub enum DataMatch {
     DataMatch32(u32),
@@ -57,213 +54,129 @@ impl From<DataMatch> for u64 {
 }
 
 #[derive(Error, Debug)]
-///
 /// Enum for VM error
 pub enum HypervisorVmError {
-    ///
     /// Create Vcpu error
-    ///
     #[error("Failed to create Vcpu")]
     CreateVcpu(#[source] anyhow::Error),
-    ///
     /// Identity map address error
-    ///
     #[error("Failed to set identity map address")]
     SetIdentityMapAddress(#[source] anyhow::Error),
-    ///
     /// TSS address error
-    ///
     #[error("Failed to set TSS address")]
     SetTssAddress(#[source] anyhow::Error),
-    ///
     /// Create interrupt controller error
-    ///
     #[error("Failed to create interrupt controller")]
     CreateIrq(#[source] anyhow::Error),
-    ///
     /// Register interrupt event error
-    ///
     #[error("Failed to register interrupt event")]
     RegisterIrqFd(#[source] anyhow::Error),
-    ///
     /// Un register interrupt event error
-    ///
     #[error("Failed to unregister interrupt event")]
     UnregisterIrqFd(#[source] anyhow::Error),
-    ///
     /// Register IO event error
-    ///
     #[error("Failed to register IO event")]
     RegisterIoEvent(#[source] anyhow::Error),
-    ///
     /// Unregister IO event error
-    ///
     #[error("Failed to unregister IO event")]
     UnregisterIoEvent(#[source] anyhow::Error),
-    ///
     /// Set GSI routing error
-    ///
     #[error("Failed to set GSI routing")]
     SetGsiRouting(#[source] anyhow::Error),
-    ///
     /// Create user memory error
-    ///
     #[error("Failed to create user memory")]
     CreateUserMemory(#[source] anyhow::Error),
-    ///
     /// Remove user memory region error
-    ///
     #[error("Failed to remove user memory")]
     RemoveUserMemory(#[source] anyhow::Error),
-    ///
     /// Create device error
-    ///
     #[error("Failed to set GSI routing")]
     CreateDevice(#[source] anyhow::Error),
-    ///
     /// Get preferred target error
-    ///
     #[error("Failed to get preferred target")]
     GetPreferredTarget(#[source] anyhow::Error),
-    ///
     /// Enable split Irq error
-    ///
     #[error("Failed to enable split Irq")]
     EnableSplitIrq(#[source] anyhow::Error),
-    ///
     /// Enable x2apic API error
-    ///
     #[error("Failed to enable x2apic API")]
     EnableX2ApicApi(#[source] anyhow::Error),
     /// Get clock error
-    ///
     #[error("Failed to get clock")]
     GetClock(#[source] anyhow::Error),
-    ///
     /// Set clock error
-    ///
     #[error("Failed to set clock")]
     SetClock(#[source] anyhow::Error),
-    ///
     /// Capture guest timer state error (aarch64)
-    ///
     #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
     #[error("Failed to capture the guest timer state")]
     CaptureTimerState(#[source] anyhow::Error),
-    ///
     /// Restore guest timer state error (aarch64)
-    ///
     #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
     #[error("Failed to restore the guest timer state")]
     RestoreTimerState(#[source] anyhow::Error),
-    ///
     /// Counter frequency mismatch on restore (aarch64)
-    ///
     #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
     #[error(
         "Saved counter frequency ({saved} Hz) != host ({host} Hz); refusing to advance guest counter"
     )]
     CntfrqMismatch { saved: u64, host: u64 },
-    ///
     /// Create passthrough device
-    ///
     #[error("Failed to create passthrough device")]
     CreatePassthroughDevice(#[source] anyhow::Error),
     /// Write to Guest memory
-    ///
     #[error("Failed to write to guest memory")]
-    GuestMemWrite(#[source] anyhow::Error),
-    ///
+    GuestMemWrite(#[source] GuestMemoryError),
     /// Read Guest memory
-    ///
     #[error("Failed to read guest memory")]
-    GuestMemRead(#[source] anyhow::Error),
-    ///
+    GuestMemRead(#[source] GuestMemoryError),
     /// Start dirty log error
-    ///
     #[error("Failed to get dirty log")]
     StartDirtyLog(#[source] anyhow::Error),
-    ///
     /// Get dirty log error
-    ///
     #[error("Failed to get dirty log")]
     GetDirtyLog(#[source] anyhow::Error),
 
     #[cfg(feature = "sev_snp")]
-    ///
     /// Error initializing SEV-SNP on the VM
-    ///
     #[error("Failed to initialize SEV-SNP")]
     InitializeSevSnp(#[source] io::Error),
 
-    #[cfg(feature = "tdx")]
-    ///
-    /// Error initializing TDX on the VM
-    ///
-    #[error("Failed to initialize TDX")]
-    InitializeTdx(#[source] io::Error),
-    #[cfg(feature = "tdx")]
-    ///
-    /// Error finalizing the TDX configuration on the VM
-    ///
-    #[error("Failed to finalize TDX")]
-    FinalizeTdx(#[source] io::Error),
-    #[cfg(feature = "tdx")]
-    ///
-    /// Error initializing the TDX memory region
-    ///
-    #[error("Failed to initialize memory region TDX")]
-    InitMemRegionTdx(#[source] io::Error),
-    ///
     /// Create Vgic error
-    ///
     #[error("Failed to create Vgic")]
     CreateVgic(#[source] anyhow::Error),
-    ///
     /// Create Vaia error
-    ///
     #[error("Failed to create Vaia")]
     CreateVaia(#[source] anyhow::Error),
-    ///
     /// Import isolated pages error
-    ///
     #[error("Failed to import isolated pages")]
     ImportIsolatedPages(#[source] anyhow::Error),
     /// Failed to complete isolated import
-    ///
     #[error("Failed to complete isolated import")]
     CompleteIsolatedImport(#[source] anyhow::Error),
     /// Failed to set VM property
-    ///
     #[error("Failed to set VM property")]
     SetVmProperty(#[source] anyhow::Error),
-    ///
     /// Modify GPA host access error
-    ///
     #[cfg(feature = "sev_snp")]
     #[error("Failed to modify GPA host access")]
     ModifyGpaHostAccess(#[source] anyhow::Error),
-    ///
     /// Failed to mmap
-    ///
     #[cfg(feature = "sev_snp")]
     #[error("Failed to mmap:")]
     MmapToRoot,
-    ///
     /// Failed to initialize VM
-    ///
     #[error("Failed to initialize VM")]
     InitializeVm(#[source] anyhow::Error),
+    /// Failed to check the xsave2 capability
+    #[error("Failed to check the xsave2 capability")]
+    CheckXsave2(#[source] anyhow::Error),
     #[cfg(all(target_arch = "x86_64", feature = "mshv"))]
-    ///
     /// Failed to retrieve list of MSRs.
-    ///
     #[error("Failed to get the list of supported MSRs")]
     GetMsrList(#[source] anyhow::Error),
 }
-///
 /// Result type for returning from a function
-///
 pub(crate) type Result<T> = result::Result<T, HypervisorVmError>;
 
 /// Configuration data for legacy interrupts.
@@ -315,11 +228,9 @@ pub enum MemoryVisibility {
     Private,
 }
 
-///
 /// Trait to represent a Vm
 ///
 /// This crate provides a hypervisor-agnostic interfaces for Vm
-///
 pub trait Vm: Send + Sync + Any {
     #[cfg(target_arch = "x86_64")]
     /// Sets the address of the one-page region in the VM's address space.
@@ -410,9 +321,8 @@ pub trait Vm: Send + Sync + Any {
     }
     /// Re-establish the guest clock before the vCPUs resume. `mode` distinguishes a
     /// same-host pause/resume (the clock kept running) from a restore/migration where
-    /// it must catch up to wall time; x86 ignores it (kvmclock is re-applied on every
-    /// resume). aarch64 writes the counter on all `vcpus` (older kernels track the
-    /// offset per-vCPU); x86 ignores `vcpus`.
+    /// it must catch up to wall time. aarch64 writes the counter on all `vcpus` (older
+    /// kernels track the offset per-vCPU).
     fn restore_clock(
         &self,
         _vcpus: &[&dyn Vcpu],
@@ -432,31 +342,6 @@ pub trait Vm: Send + Sync + Any {
     #[cfg(feature = "sev_snp")]
     /// Initialize SEV-SNP on this VM
     fn sev_snp_init(&self, guest_policy: SnpPolicy) -> Result<()>;
-    #[cfg(feature = "tdx")]
-    /// Initialize TDX on this VM
-    fn tdx_init(&self, _cpuid: &[CpuIdEntry], _max_vcpus: u32) -> Result<()> {
-        unimplemented!()
-    }
-    #[cfg(feature = "tdx")]
-    /// Finalize the configuration of TDX on this VM
-    fn tdx_finalize(&self) -> Result<()> {
-        unimplemented!()
-    }
-    #[cfg(feature = "tdx")]
-    /// Initialize a TDX memory region for this VM
-    ///
-    /// # Safety
-    ///
-    /// `_host_address` must be valid for `_size` bytes
-    unsafe fn tdx_init_memory_region(
-        &self,
-        _host_address: *mut u8,
-        _guest_address: u64,
-        _size: usize,
-        _measure: bool,
-    ) -> Result<()> {
-        unimplemented!()
-    }
     /// Downcast to the underlying hypervisor VM type
     fn as_any(&self) -> &dyn Any;
     /// Import the isolated pages

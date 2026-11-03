@@ -82,9 +82,8 @@ The following sections describe how to build and run Cloud Hypervisor.
 
 ## Host OS
 
-For required KVM functionality and adequate performance the recommended host
-kernel version is 5.13. The majority of the CI currently tests with kernel
-version 5.15.
+For required KVM functionality and adequate performance the minimum supported
+host kernel version is 6.8.
 
 ## Use Pre-built Binaries
 
@@ -316,7 +315,7 @@ Currently the following items are **not** guaranteed across updates:
 * Snapshot/restore is not supported across different versions
 * Live migration is not supported across different versions
 * The following features are considered experimental and may change
-  substantially between releases: TDX, vfio-user, vDPA.
+  substantially between releases: vfio-user, vDPA, CPU profiles.
 
 Further details can be found in the [release documentation](docs/releases.md).
 
@@ -409,4 +408,5 @@ list](https://lists.cloudhypervisor.org/g/dev/).
 
 ## Security issues
 
-Please contact the maintainers listed in the MAINTAINERS.md file with security issues.
+Please report security issues as described in [SECURITY.md](SECURITY.md).
+Do not file a public issue for them.

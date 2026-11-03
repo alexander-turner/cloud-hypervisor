@@ -13,7 +13,6 @@ use std::path::Path;
 use std::{io, result, str};
 
 use log::warn;
-use remain::sorted;
 use thiserror::Error;
 
 pub use super::header::{
@@ -28,14 +27,13 @@ use super::header::{
 use super::qcow_raw_file::QcowRawFile;
 use super::refcount::RefCount;
 pub(crate) use super::util::MAX_NESTING_DEPTH;
-use super::util::{L1_TABLE_OFFSET_MASK, L2_TABLE_OFFSET_MASK, div_round_up_u64};
+use super::util::{L1_TABLE_OFFSET_MASK, L2_TABLE_OFFSET_MASK};
 use super::vec_cache::{CacheMap, VecCache};
 use super::{metadata, refcount};
 use crate::aligned_file::AlignedFile;
 use crate::error::{BlockError, BlockErrorKind, BlockResult};
 use crate::query_device_size;
 
-#[sorted]
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("Backing file I/O error: {0}")]
@@ -74,6 +72,8 @@ pub enum Error {
     InvalidClusterIndex,
     #[error("Invalid cluster size")]
     InvalidClusterSize,
+    #[error("Invalid header length: {0}")]
+    InvalidHeaderLength(u32),
     #[error("Invalid index")]
     InvalidIndex,
     #[error("Invalid L1 table offset")]
@@ -116,10 +116,14 @@ pub enum Error {
     UnsupportedBackingFileFormat(String),
     #[error("Unsupported compression type")]
     UnsupportedCompressionType,
+    #[error("Unsupported encryption method: {0}")]
+    UnsupportedCryptMethod(u32),
     #[error("Unsupported qcow2 feature(s)")]
     UnsupportedFeature(#[source] MissingFeatureError),
     #[error("Unsupported refcount order")]
     UnsupportedRefcountOrder,
+    #[error("Images with internal snapshots are not supported")]
+    UnsupportedSnapshots,
     #[error("Unsupported version: {0}")]
     UnsupportedVersion(u32),
     #[error("Failed to write header")]
@@ -248,9 +252,9 @@ pub(crate) fn parse_qcow(
             Error::InvalidMagic
             | Error::BackingFileTooLong(_)
             | Error::InvalidBackingFileName(_) => BlockErrorKind::InvalidFormat,
-            Error::UnsupportedFeature(_) | Error::UnsupportedCompressionType => {
-                BlockErrorKind::UnsupportedFeature
-            }
+            Error::UnsupportedFeature(_)
+            | Error::UnsupportedCompressionType
+            | Error::UnsupportedSnapshots => BlockErrorKind::UnsupportedFeature,
             _ => BlockErrorKind::Io,
         };
         BlockError::new(kind, e)
@@ -376,6 +380,13 @@ pub(crate) fn parse_qcow(
         .ok_or_else(|| BlockError::new(BlockErrorKind::InvalidFormat, Error::InvalidClusterSize))?;
     let is_writable = raw_file.file().is_writable();
 
+    if is_writable && header.nb_snapshots != 0 {
+        return Err(BlockError::new(
+            BlockErrorKind::UnsupportedFeature,
+            Error::UnsupportedSnapshots,
+        ));
+    }
+
     if header.is_corrupt() {
         if is_writable {
             return Err(BlockError::new(
@@ -402,10 +413,10 @@ pub(crate) fn parse_qcow(
     }
 
     let entries_per_cluster = cluster_size / size_of::<u64>() as u64;
-    let num_clusters = div_round_up_u64(header.size, cluster_size);
-    let num_l2_clusters = div_round_up_u64(num_clusters, entries_per_cluster);
-    let l1_clusters = div_round_up_u64(num_l2_clusters, entries_per_cluster);
-    let header_clusters = div_round_up_u64(size_of::<QcowHeader>() as u64, cluster_size);
+    let num_clusters = header.size.div_ceil(cluster_size);
+    let num_l2_clusters = num_clusters.div_ceil(entries_per_cluster);
+    let l1_clusters = num_l2_clusters.div_ceil(entries_per_cluster);
+    let header_clusters = (size_of::<QcowHeader>() as u64).div_ceil(cluster_size);
     if num_l2_clusters > MAX_RAM_POINTER_TABLE_SIZE {
         return Err(BlockError::new(
             BlockErrorKind::CorruptImage,
@@ -422,7 +433,7 @@ pub(crate) fn parse_qcow(
             .map_err(|e| BlockError::new(BlockErrorKind::Io, Error::ReadingHeader(e)))?,
     );
 
-    let num_clusters = div_round_up_u64(header.size, cluster_size);
+    let num_clusters = header.size.div_ceil(cluster_size);
     let refcount_clusters = max_refcount_clusters(
         header.refcount_order,
         cluster_size as u32,
@@ -569,7 +580,7 @@ fn rebuild_refcounts(raw_file: &mut QcowRawFile, header: QcowHeader) -> BlockRes
         refcount_bits: u64,
     ) -> Result<()> {
         let entries_per_cluster = cluster_size / size_of::<u64>() as u64;
-        let l1_clusters = div_round_up_u64(u64::from(header.l1_size), entries_per_cluster);
+        let l1_clusters = u64::from(header.l1_size).div_ceil(entries_per_cluster);
         let l1_table_offset = header.l1_table_offset;
         for i in 0..l1_clusters {
             add_ref(
@@ -770,21 +781,19 @@ fn rebuild_refcounts(raw_file: &mut QcowRawFile, header: QcowHeader) -> BlockRes
     };
     let refcount_block_entries = cluster_size * 8 / refcount_bits;
     let pointers_per_cluster = cluster_size / size_of::<u64>() as u64;
-    let data_clusters = div_round_up_u64(header.size, cluster_size);
-    let l2_clusters = div_round_up_u64(data_clusters, pointers_per_cluster);
-    let l1_clusters = div_round_up_u64(l2_clusters, pointers_per_cluster);
-    let header_clusters = div_round_up_u64(size_of::<QcowHeader>() as u64, cluster_size);
+    let data_clusters = header.size.div_ceil(cluster_size);
+    let l2_clusters = data_clusters.div_ceil(pointers_per_cluster);
+    let l1_clusters = l2_clusters.div_ceil(pointers_per_cluster);
+    let header_clusters = (size_of::<QcowHeader>() as u64).div_ceil(cluster_size);
     let max_clusters = data_clusters + l2_clusters + l1_clusters + header_clusters;
     // The file can end past what the virtual size needs.
-    let mut max_valid_cluster_index = max(max_clusters, div_round_up_u64(file_size, cluster_size));
-    let refblock_clusters = div_round_up_u64(max_valid_cluster_index, refcount_block_entries);
-    let reftable_clusters = div_round_up_u64(refblock_clusters, pointers_per_cluster);
+    let mut max_valid_cluster_index = max(max_clusters, file_size.div_ceil(cluster_size));
+    let refblock_clusters = max_valid_cluster_index.div_ceil(refcount_block_entries);
+    let reftable_clusters = refblock_clusters.div_ceil(pointers_per_cluster);
     // Account for refblocks and the ref table size needed to address them.
-    let refblocks_for_refs = div_round_up_u64(
-        refblock_clusters + reftable_clusters,
-        refcount_block_entries,
-    );
-    let reftable_clusters_for_refs = div_round_up_u64(refblocks_for_refs, refcount_block_entries);
+    let refblocks_for_refs =
+        (refblock_clusters + reftable_clusters).div_ceil(refcount_block_entries);
+    let reftable_clusters_for_refs = refblocks_for_refs.div_ceil(refcount_block_entries);
     max_valid_cluster_index += refblock_clusters + reftable_clusters;
     max_valid_cluster_index += refblocks_for_refs + reftable_clusters_for_refs;
 
@@ -804,9 +813,10 @@ fn rebuild_refcounts(raw_file: &mut QcowRawFile, header: QcowHeader) -> BlockRes
     }
 
     // Rebuilding only the refblocks that cover the file keeps the work proportional to the image
-    let file_clusters = div_round_up_u64(file_size, cluster_size);
-    let used_refblocks =
-        div_round_up_u64(file_clusters, refcount_block_entries).min(refblock_clusters);
+    let file_clusters = file_size.div_ceil(cluster_size);
+    let used_refblocks = file_clusters
+        .div_ceil(refcount_block_entries)
+        .min(refblock_clusters);
 
     // The rebuilt table is written in place and has to fit the declared one.
     let declared_table_entries =
@@ -1034,6 +1044,25 @@ mod tests {
             .expect("Failed to create header.");
         try_open_qcow_header(&header, false)
             .expect("Failed to create QcowDisk from default header");
+    }
+
+    #[test]
+    fn header_with_unsupported_crypt_method_is_rejected() {
+        for mut header in [valid_header_v2(), valid_header_v3()] {
+            header[32..36].copy_from_slice(&1u32.to_be_bytes());
+            let err = QcowHeader::new(&basic_file(&header)).unwrap_err();
+            assert!(matches!(err, Error::UnsupportedCryptMethod(1)), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn header_with_invalid_v3_length_is_rejected() {
+        for bad in [V2_BARE_HEADER_SIZE, 0xffff_ffff] {
+            let mut header = valid_header_v3();
+            header[100..104].copy_from_slice(&bad.to_be_bytes());
+            let err = QcowHeader::new(&basic_file(&header)).unwrap_err();
+            assert!(matches!(err, Error::InvalidHeaderLength(_)), "{err:?}");
+        }
     }
 
     #[test]
@@ -1779,6 +1808,39 @@ mod tests {
             result.is_ok(),
             "Expected dirty bit to be accepted, got: {result:?}"
         );
+    }
+
+    fn image_with_internal_snapshots(nb_snapshots: u32) -> TempFile {
+        let tf = QcowTempDisk::new(0x1_0000, None, false, true, false)
+            .unwrap()
+            .into_tempfile();
+        // nb_snapshots is at offset 60 in the v2/v3 header.
+        tf.as_file()
+            .write_all_at(&nb_snapshots.to_be_bytes(), 60)
+            .unwrap();
+        tf
+    }
+
+    #[test]
+    fn internal_snapshots_rejected_for_writable_open() {
+        let tf = image_with_internal_snapshots(1);
+        let file = tf.as_file().try_clone().unwrap();
+        let err = QcowDisk::new(file, false, false, true, false).unwrap_err();
+        assert_eq!(err.kind(), BlockErrorKind::UnsupportedFeature, "{err}");
+    }
+
+    #[test]
+    fn internal_snapshots_allowed_readonly() {
+        let tf = image_with_internal_snapshots(1);
+        let file = OpenOptions::new().read(true).open(tf.as_path()).unwrap();
+        QcowDisk::new(file, false, false, true, false).unwrap();
+    }
+
+    #[test]
+    fn no_snapshots_still_open_writable() {
+        let tf = image_with_internal_snapshots(0);
+        let file = tf.as_file().try_clone().unwrap();
+        QcowDisk::new(file, false, false, true, false).unwrap();
     }
 
     #[test]

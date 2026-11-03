@@ -10,14 +10,13 @@ use std::result;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 
-use byteorder::{ByteOrder, LittleEndian};
 use log::{debug, error};
 use serde::{Deserialize, Serialize};
 use virtio_queue::{Queue, QueueT};
 use vm_migration::{MigratableError, Pausable, Snapshot, Snapshottable};
 
 use super::pci_device::VIRTQ_MSI_NO_VECTOR;
-use crate::VirtioDevice;
+use crate::{DEVICE_FEATURES_OK, VirtioDevice};
 
 pub const VIRTIO_PCI_COMMON_CONFIG_ID: &str = "virtio_pci_common_config";
 
@@ -200,15 +199,15 @@ impl VirtioPciCommonConfig {
             }
             2 => {
                 let v = self.read_common_config_word(offset, queues);
-                LittleEndian::write_u16(data, v);
+                data.copy_from_slice(&v.to_le_bytes());
             }
             4 => {
                 let v = self.read_common_config_dword(offset);
-                LittleEndian::write_u32(data, v);
+                data.copy_from_slice(&v.to_le_bytes());
             }
             8 => {
                 let v = self.read_common_config_qword(offset);
-                LittleEndian::write_u64(data, v);
+                data.copy_from_slice(&v.to_le_bytes());
             }
             _ => debug!("invalid data length for virtio read: len {}", data.len()),
         }
@@ -219,11 +218,23 @@ impl VirtioPciCommonConfig {
 
         match data.len() {
             1 => self.write_common_config_byte(offset, data[0]),
-            2 => self.write_common_config_word(offset, LittleEndian::read_u16(data), queues),
+            2 => self.write_common_config_word(
+                offset,
+                u16::from_le_bytes(data.try_into().expect("data should be 2 bytes")),
+                queues,
+            ),
             4 => {
-                self.write_common_config_dword(offset, LittleEndian::read_u32(data), queues);
+                self.write_common_config_dword(
+                    offset,
+                    u32::from_le_bytes(data.try_into().expect("data should be 4 bytes")),
+                    queues,
+                );
             }
-            8 => self.write_common_config_qword(offset, LittleEndian::read_u64(data), queues),
+            8 => self.write_common_config_qword(
+                offset,
+                u64::from_le_bytes(data.try_into().expect("data should be 8 bytes")),
+                queues,
+            ),
             _ => debug!("invalid data length for virtio write: len {}", data.len()),
         }
     }
@@ -292,7 +303,13 @@ impl VirtioPciCommonConfig {
             }
             0x1c => self.with_queue_mut(queues, |q| {
                 let ready = value == 1;
-                q.set_ready(ready);
+                // Virtio 1.4, 3.1.1: negotiate features before setting up queues.
+                if ready
+                    && self.driver_status.load(Ordering::Acquire) & DEVICE_FEATURES_OK as u8 == 0
+                {
+                    debug!("Cannot enable virtqueue before feature negotiation");
+                    return;
+                }
                 let access_platform = if ready {
                     self.device.lock().unwrap().access_platform()
                 } else {
@@ -305,7 +322,6 @@ impl VirtioPciCommonConfig {
                         Ok(addr) => addr,
                         Err(e) => {
                             error!("Failed to translate desc_table GVA: {e}");
-                            q.set_ready(false);
                             return;
                         }
                     };
@@ -315,7 +331,6 @@ impl VirtioPciCommonConfig {
                         Ok(addr) => addr,
                         Err(e) => {
                             error!("Failed to translate avail_ring GVA: {e}");
-                            q.set_ready(false);
                             return;
                         }
                     };
@@ -325,7 +340,6 @@ impl VirtioPciCommonConfig {
                         Ok(addr) => addr,
                         Err(e) => {
                             error!("Failed to translate used_ring GVA: {e}");
-                            q.set_ready(false);
                             return;
                         }
                     };
@@ -342,6 +356,7 @@ impl VirtioPciCommonConfig {
                         Some((used_ring >> 32) as u32),
                     );
                 }
+                q.set_ready(ready);
             }),
             _ => {
                 debug!("invalid virtio register word write: 0x{offset:x}");
@@ -424,6 +439,12 @@ impl VirtioPciCommonConfig {
 
     fn with_queue_mut<F: FnOnce(&mut Queue)>(&self, queues: &mut [Queue], f: F) {
         if let Some(queue) = queues.get_mut(self.queue_select as usize) {
+            // PCI queues cannot be disabled or reconfigured without a reset
+            // (virtio 1.4, 4.1.4.3.2).
+            if queue.ready() {
+                debug!("Cannot change enabled virtqueue {}", self.queue_select);
+                return;
+            }
             f(queue);
         }
     }
@@ -503,19 +524,19 @@ mod tests {
 
         // Device features is read-only and passed through from the device.
         regs.write(0x04, &[0, 0, 0, 0], &mut queues);
-        let mut read_back = vec![0, 0, 0, 0];
+        let mut read_back = [0; 4];
         regs.read(0x04, &mut read_back, &queues);
-        assert_eq!(LittleEndian::read_u32(&read_back), DUMMY_FEATURES as u32);
+        assert_eq!(u32::from_le_bytes(read_back), DUMMY_FEATURES as u32);
 
         // Feature select registers are read/write.
         regs.write(0x00, &[1, 2, 3, 4], &mut queues);
-        let mut read_back = vec![0, 0, 0, 0];
+        let mut read_back = [0; 4];
         regs.read(0x00, &mut read_back, &queues);
-        assert_eq!(LittleEndian::read_u32(&read_back), 0x0403_0201);
+        assert_eq!(u32::from_le_bytes(read_back), 0x0403_0201);
         regs.write(0x08, &[1, 2, 3, 4], &mut queues);
-        let mut read_back = vec![0, 0, 0, 0];
+        let mut read_back = [0; 4];
         regs.read(0x08, &mut read_back, &queues);
-        assert_eq!(LittleEndian::read_u32(&read_back), 0x0403_0201);
+        assert_eq!(u32::from_le_bytes(read_back), 0x0403_0201);
 
         // 'queue_select' can be read and written.
         regs.write(0x16, &[0xaa, 0x55], &mut queues);
@@ -546,9 +567,9 @@ mod tests {
         regs.write(0x16, &[0xFF, 0xFF], &mut queues);
 
         // Read queue_msix_vector — must not panic, should return VIRTQ_MSI_NO_VECTOR.
-        let mut read_back = vec![0x00, 0x00];
+        let mut read_back = [0x00, 0x00];
         regs.read(0x1a, &mut read_back, &queues);
-        assert_eq!(LittleEndian::read_u16(&read_back), VIRTQ_MSI_NO_VECTOR);
+        assert_eq!(u16::from_le_bytes(read_back), VIRTQ_MSI_NO_VECTOR);
 
         // Write queue_msix_vector — must not panic.
         regs.write(0x1a, &[0xAB, 0xCD], &mut queues);
@@ -640,5 +661,56 @@ mod tests {
         regs.config_changed.store(true, Ordering::Release);
         regs.consume_config_change();
         assert_eq!(regs.config_generation.load(Ordering::Acquire), 0x00);
+    }
+
+    #[test]
+    fn queue_enable_requires_features_ok() {
+        let mut regs = make_regs(0);
+        let mut queues = vec![Queue::new(QUEUE_SIZE).unwrap()];
+
+        regs.write(0x1c, &1u16.to_le_bytes(), &mut queues);
+        assert!(!queues[0].ready());
+
+        regs.driver_status
+            .store(DEVICE_FEATURES_OK as u8, Ordering::Release);
+        for value in [0u16, 2, u16::MAX] {
+            regs.write(0x1c, &value.to_le_bytes(), &mut queues);
+            assert!(!queues[0].ready());
+        }
+        regs.write(0x1c, &1u16.to_le_bytes(), &mut queues);
+        assert!(queues[0].ready());
+    }
+
+    #[test]
+    fn enabled_queue_configuration_is_immutable() {
+        let mut regs = make_regs(0);
+        regs.driver_status
+            .store(DEVICE_FEATURES_OK as u8, Ordering::Release);
+        let mut queues = vec![Queue::new(QUEUE_SIZE).unwrap()];
+        let addresses = [0x1000u64, 0x2000, 0x3000];
+
+        regs.write(0x18, &8u16.to_le_bytes(), &mut queues);
+        for (offset, address) in [0x20, 0x28, 0x30].into_iter().zip(addresses) {
+            regs.write(offset, &address.to_le_bytes(), &mut queues);
+        }
+        regs.write(0x1c, &1u16.to_le_bytes(), &mut queues);
+        assert!(queues[0].ready());
+
+        regs.write(0x18, &16u16.to_le_bytes(), &mut queues);
+        for offset in [0x20, 0x28, 0x30] {
+            regs.write(offset, &u64::MAX.to_le_bytes(), &mut queues);
+        }
+        regs.write(0x1c, &0u16.to_le_bytes(), &mut queues);
+
+        assert!(queues[0].ready());
+        assert_eq!(queues[0].size(), 8);
+        assert_eq!(
+            [
+                queues[0].desc_table(),
+                queues[0].avail_ring(),
+                queues[0].used_ring()
+            ],
+            addresses
+        );
     }
 }

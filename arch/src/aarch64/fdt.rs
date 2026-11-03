@@ -13,7 +13,6 @@ use std::hash::BuildHasher;
 use std::sync::{Arc, Mutex};
 use std::{cmp, result, str};
 
-use byteorder::{BigEndian, ByteOrder};
 use fdt_parser::node::FdtNode;
 use hypervisor::arch::aarch64::gic::Vgic;
 use hypervisor::arch::aarch64::regs::{
@@ -88,6 +87,9 @@ pub enum Error {
     /// Failure in writing FDT in memory.
     #[error("Failure in writing FDT in memory")]
     WriteFdtToMemory(#[source] GuestMemoryError),
+    /// The FDT does not fit the space reserved for it.
+    #[error("The FDT is {0} bytes, larger than the {1} bytes reserved for it")]
+    FdtTooLarge(usize /* FDT size */, u64 /* limit */),
 }
 type Result<T> = result::Result<T, Error>;
 
@@ -105,6 +107,7 @@ pub fn create_fdt<T: DeviceInfoForFdt + Clone + Debug, S: BuildHasher>(
     numa_nodes: &NumaNodes,
     virtio_iommu_bdf: Option<u32>,
     pmu_supported: bool,
+    nested: bool,
     uefi_mmap_size: Option<u32>,
 ) -> FdtWriterResult<Vec<u8>> {
     // Allocate stuff necessary for the holding the blob.
@@ -133,7 +136,7 @@ pub fn create_fdt<T: DeviceInfoForFdt + Clone + Debug, S: BuildHasher>(
         create_pmu_node(&mut fdt)?;
     }
     create_clock_node(&mut fdt)?;
-    create_psci_node(&mut fdt)?;
+    create_psci_node(&mut fdt, nested)?;
     create_devices_node(&mut fdt, device_info)?;
     create_pci_nodes(&mut fdt, pci_space_info, virtio_iommu_bdf)?;
     if numa_nodes.len() > 1 {
@@ -149,6 +152,12 @@ pub fn create_fdt<T: DeviceInfoForFdt + Clone + Debug, S: BuildHasher>(
 }
 
 pub fn write_fdt_to_memory(fdt_final: &[u8], guest_mem: &GuestMemoryMmap) -> Result<()> {
+    if fdt_final.len() as u64 > super::layout::FDT_MAX_SIZE {
+        return Err(Error::FdtTooLarge(
+            fdt_final.len(),
+            super::layout::FDT_MAX_SIZE,
+        ));
+    }
     // Write FDT to memory.
     guest_mem
         .write_slice(fdt_final, super::layout::FDT_START)
@@ -224,10 +233,9 @@ fn create_cpu_nodes(
         // are present allowed such guest kernels to boot properly and
         // rely solely on ACPI tables to setup NUMA
         if numa_nodes.len() > 1 && !has_generic_initiator {
-            for numa_node_idx in 0..numa_nodes.len() {
-                let numa_node = numa_nodes.get(&(numa_node_idx as u32));
-                if numa_node.unwrap().cpus.contains(&(cpu_id as u32)) {
-                    fdt.property_u32("numa-node-id", numa_node_idx as u32)?;
+            for (numa_node_id, numa_node) in numa_nodes {
+                if numa_node.cpus.contains(&(cpu_id as u32)) {
+                    fdt.property_u32("numa-node-id", *numa_node_id)?;
                 }
             }
         }
@@ -372,13 +380,12 @@ fn create_memory_node(
     // are present allowed guest kernels to boot and
     // rely solely on ACPI tables to setup NUMA
     if numa_nodes.len() > 1 && !has_generic_initiator {
-        for numa_node_idx in 0..numa_nodes.len() {
-            let numa_node = numa_nodes.get(&(numa_node_idx as u32));
+        for (numa_node_id, numa_node) in numa_nodes {
             let mut mem_reg_prop: Vec<u64> = Vec::new();
             let mut node_memory_addr: u64 = 0;
             // Each memory zone of numa will have its own memory node, but
             // different numa nodes should not share same memory zones.
-            for memory_region in numa_node.unwrap().memory_regions.iter() {
+            for memory_region in numa_node.memory_regions.iter() {
                 let memory_region_start_addr: u64 = memory_region.start_addr().raw_value();
                 let memory_region_size: u64 = memory_region.size() as u64;
                 mem_reg_prop.push(memory_region_start_addr);
@@ -394,7 +401,7 @@ fn create_memory_node(
                 let memory_node = fdt.begin_node(&memory_node_name)?;
                 fdt.property_string("device_type", "memory")?;
                 fdt.property_array_u64("reg", &mem_reg_prop)?;
-                fdt.property_u32("numa-node-id", numa_node_idx as u32)?;
+                fdt.property_u32("numa-node-id", *numa_node_id)?;
                 fdt.end_node(memory_node)?;
             }
         }
@@ -430,6 +437,7 @@ fn create_memory_node(
             ram_regions
         };
 
+        #[expect(clippy::panic, reason = "memory layout invariant")]
         if ram_regions.len() > 2 {
             panic!(
                 "There should be up to two non-continuous regions, divided by the
@@ -445,6 +453,7 @@ fn create_memory_node(
             let ram_start = super::layout::RAM_START.raw_value();
             let mem_32bit_reserved_start = super::layout::MEM_32BIT_RESERVED_START.raw_value();
 
+            #[expect(clippy::panic, reason = "memory layout invariant")]
             if !((first_region_start <= &ram_start)
                 && (first_region_end > &ram_start)
                 && (first_region_end <= &mem_32bit_reserved_start))
@@ -468,6 +477,7 @@ fn create_memory_node(
         if let Some((second_region_start, second_region_end)) = ram_regions.get(1) {
             let ram_64bit_start = super::layout::RAM_64BIT_START.raw_value();
 
+            #[expect(clippy::panic, reason = "memory layout invariant")]
             if second_region_start != &ram_64bit_start {
                 panic!(
                     "Unexpected second memory region layout: start: 0x{second_region_start:08x}, ram_64bit_start: 0x{ram_64bit_start:08x}"
@@ -608,14 +618,14 @@ fn create_timer_node(fdt: &mut FdtWriter) -> FdtWriterResult<()> {
     Ok(())
 }
 
-fn create_psci_node(fdt: &mut FdtWriter) -> FdtWriterResult<()> {
+fn create_psci_node(fdt: &mut FdtWriter, nested: bool) -> FdtWriterResult<()> {
     let compatible = "arm,psci-0.2";
     let psci_node = fdt.begin_node("psci")?;
     fdt.property_string("compatible", compatible)?;
     // Two methods available: hvc and smc.
-    // As per documentation, PSCI calls between a guest and hypervisor may use the HVC conduit instead of SMC.
-    // So, since we are using kvm, we need to use hvc.
-    fdt.property_string("method", "hvc")?;
+    // Regular EL1 guests use the HVC conduit.
+    // With nested virtualisation, L1 guests need to use SMC as HVC is forwarded to vEL2.
+    fdt.property_string("method", if nested { "smc" } else { "hvc" })?;
     fdt.end_node(psci_node)?;
 
     Ok(())
@@ -1053,9 +1063,8 @@ fn print_node(node: FdtNode<'_, '_>, n_spaces: usize) {
                 indent = (n_spaces + 2)
             );
         } else {
-            let mut array = Vec::with_capacity(256);
-            array.resize(value.len() / 4, 0u32);
-            BigEndian::read_u32_into(value, &mut array);
+            let (chunks, _) = value.as_chunks::<4>();
+            let array: Vec<u32> = chunks.iter().map(|c| u32::from_be_bytes(*c)).collect();
             debug!(
                 "{:indent$}{} : {:X?}",
                 "",
@@ -1076,8 +1085,41 @@ fn print_node(node: FdtNode<'_, '_>, n_spaces: usize) {
 mod tests {
     use std::collections::BTreeMap;
 
+    use super::super::layout;
     use super::*;
     use crate::NumaNode;
+
+    #[test]
+    fn test_write_fdt_to_memory_size() {
+        let max = usize::try_from(layout::FDT_MAX_SIZE).unwrap();
+        let mem = GuestMemoryMmap::from_ranges(&[(layout::RAM_START, 2 * max)]).unwrap();
+
+        write_fdt_to_memory(&vec![0; max], &mem).unwrap();
+        assert!(matches!(
+            write_fdt_to_memory(&vec![0; max + 1], &mem),
+            Err(Error::FdtTooLarge(n, m)) if n == max + 1 && m == layout::FDT_MAX_SIZE
+        ));
+    }
+
+    #[test]
+    fn test_psci_conduit_nested_virt() {
+        let mut writer = FdtWriter::new().unwrap();
+        let root = writer.begin_node("").unwrap();
+        create_psci_node(&mut writer, true).unwrap();
+        writer.end_node(root).unwrap();
+
+        let dtb = writer.finish().unwrap();
+        let fdt = fdt_parser::Fdt::new(&dtb).unwrap();
+        let method = fdt
+            .find_node("/psci")
+            .unwrap()
+            .property("method")
+            .unwrap()
+            .as_str()
+            .unwrap();
+
+        assert_eq!(method, "smc");
+    }
 
     // Helper function to create a simple NumaNode for testing
     fn create_test_numa_node(cpus: Vec<u32>, device_id: Option<String>) -> NumaNode {

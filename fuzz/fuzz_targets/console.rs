@@ -10,6 +10,7 @@ use std::io::{self, Write};
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::sync::Arc;
 
+use cloud_hypervisor_fuzz::FuzzCursor;
 use libfuzzer_sys::{fuzz_target, Corpus};
 use seccompiler::SeccompAction;
 use virtio_devices::{Endpoint, VirtioDevice, VirtioInterrupt, VirtioInterruptType};
@@ -36,7 +37,7 @@ const GUEST_MEM_GAP: u64 = 1024 * 1024;
 // Guest physical address for the first virt queue
 const BASE_VIRT_QUEUE_ADDR: u64 = MEM_SIZE as u64 + GUEST_MEM_GAP;
 // Number of queues
-const QUEUE_NUM: usize = 2;
+const QUEUE_NUM: u16 = 2;
 // Max entries in the queue.
 const QUEUE_SIZE: u16 = 256;
 // Descriptor table alignment
@@ -56,7 +57,7 @@ const QUEUE_BYTES_SIZE: usize = align!(
     DESC_TABLE_SIZE + AVAIL_RING_SIZE + PADDING_SIZE + USED_RING_SIZE,
     DESC_TABLE_ALIGN_SIZE
 ) as usize;
-const QUEUE_REGION_SIZE: usize = QUEUE_BYTES_SIZE * QUEUE_NUM;
+const QUEUE_REGION_SIZE: usize = QUEUE_BYTES_SIZE * QUEUE_NUM as usize;
 const VRING_DESC_F_NEXT: u16 = 1;
 const VRING_DESC_F_WRITE: u16 = 2;
 const DESCRIPTORS_PER_QUEUE: u16 = 4;
@@ -509,40 +510,6 @@ impl VirtioInterrupt for FuzzVirtioInterrupt {
     }
 }
 
-struct FuzzCursor<'a> {
-    bytes: &'a [u8],
-    index: usize,
-}
-
-impl<'a> FuzzCursor<'a> {
-    fn with_index(bytes: &'a [u8], index: usize) -> Self {
-        Self {
-            bytes,
-            index: index % bytes.len(),
-        }
-    }
-
-    fn next_u8(&mut self) -> u8 {
-        let value = self.bytes[self.index % self.bytes.len()];
-        self.index = self.index.wrapping_add(1);
-        value
-    }
-
-    fn next_u16(&mut self) -> u16 {
-        u16::from_le_bytes([self.next_u8(), self.next_u8()])
-    }
-
-    fn next_bool(&mut self) -> bool {
-        self.next_u8() & 1 != 0
-    }
-
-    fn fill_slice(&mut self, slice: &mut [u8]) {
-        for byte in slice.iter_mut() {
-            *byte = self.next_u8();
-        }
-    }
-}
-
 struct EndpointContext {
     endpoint: Endpoint,
     input_tx: Option<File>,
@@ -632,7 +599,7 @@ fn setup_virt_queues(
     for i in 0..QUEUE_NUM {
         let mut q = Queue::new(QUEUE_SIZE).unwrap();
 
-        let desc_table_addr = base_addr + (QUEUE_BYTES_SIZE * i) as u64;
+        let desc_table_addr = base_addr + (QUEUE_BYTES_SIZE * i as usize) as u64;
         let avail_ring_addr = desc_table_addr + DESC_TABLE_SIZE;
         let used_ring_addr = if bad_used_ring_mask & (1 << i) != 0 {
             MEM_SIZE as u64 + QUEUE_REGION_SIZE as u64 + GUEST_MEM_GAP

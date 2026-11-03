@@ -2,10 +2,14 @@ verbose = "info"
 
 exclude_path = [".lychee.toml"]
 
+# Check GitHub source files through the raw endpoint to avoid 503 responses
+# from the HTML pages.
+remap = [
+  '^https://github\.com/([^/]+)/([^/]+)/blob/(.+)$ https://raw.githubusercontent.com/$1/$2/$3',
+]
+
 exclude = [
   # Availability of links below should be manually verified.
-  # Page for intel TDX support, returns 403 while querying.
-  '^https://www.intel.com/content/www/us/en/developer/tools/trust-domain-extensions/overview.html',
   # Page for TPM, returns 403 while querying.
   '^https://trustedcomputinggroup.org/wp-content/uploads/PC-Client-Specific-Platform-TPM-Profile-for-TPM-2p0-v1p05p_r14_pub.pdf',
   # GitHub user smibarber referenced in `CREDITS.md` no longer exist
@@ -36,3 +40,8 @@ exclude_loopback = true
 max_retries = 3
 
 retry_wait_time = 5
+
+# Avoid rate limiting when checking remapped GitHub source links.
+[hosts."raw.githubusercontent.com"]
+concurrency = 1
+request_interval = "1s"

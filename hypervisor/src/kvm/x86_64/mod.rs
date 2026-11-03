@@ -8,14 +8,14 @@
 //
 //
 
+#[cfg(feature = "sev_snp")]
+use kvm_bindings::KVM_MEMORY_ATTRIBUTE_PRIVATE;
 use kvm_bindings::nested::KvmNestedStateBuffer;
-use log::error;
+#[cfg(feature = "sev_snp")]
+use kvm_ioctls::VmFd;
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 use vmm_sys_util::fam;
-///
 /// Export generically-named wrappers of kvm-bindings for Unix-based platforms
-///
 pub use {
     kvm_bindings::CpuId, kvm_bindings::KVM_CPUID_FLAG_SIGNIFCANT_INDEX, kvm_bindings::MsrList,
     kvm_bindings::Msrs as MsrEntries, kvm_bindings::Xsave as xsave2,
@@ -23,7 +23,7 @@ pub use {
     kvm_bindings::kvm_lapic_state, kvm_bindings::kvm_mp_state as MpState,
     kvm_bindings::kvm_msr_entry, kvm_bindings::kvm_regs, kvm_bindings::kvm_segment,
     kvm_bindings::kvm_sregs, kvm_bindings::kvm_vcpu_events as VcpuEvents,
-    kvm_bindings::kvm_xcrs as ExtendedControlRegisters, kvm_bindings::kvm_xsave,
+    kvm_bindings::kvm_xcrs as ExtendedControlRegisters,
 };
 
 use crate::arch::x86::{
@@ -35,37 +35,52 @@ use crate::kvm::{Cap, Kvm, KvmError, KvmResult};
 #[cfg(feature = "sev_snp")]
 pub(crate) mod sev;
 
-///
-/// Check KVM extension for Linux
-///
-pub fn check_required_kvm_extensions(kvm: &Kvm) -> KvmResult<()> {
-    macro_rules! check_extension {
-        ($cap:expr) => {
-            if !kvm.check_extension($cap) {
-                return Err(KvmError::CapabilityMissing($cap));
-            }
-        };
-    }
+macro_rules! check_extension {
+    ($kvm:expr, $cap:expr) => {
+        if !$kvm.check_extension($cap) {
+            return Err(KvmError::CapabilityMissing($cap));
+        }
+    };
+}
 
+/// Check KVM extension for Linux
+pub fn check_required_kvm_extensions(kvm: &Kvm) -> KvmResult<()> {
     // DeviceCtrl, EnableCap, and SetGuestDebug are also required, but some kernels have
     // the features implemented without the capability flags.
-    check_extension!(Cap::AdjustClock);
-    check_extension!(Cap::ExtCpuid);
-    check_extension!(Cap::GetTscKhz);
-    check_extension!(Cap::ImmediateExit);
-    check_extension!(Cap::Ioeventfd);
-    check_extension!(Cap::Irqchip);
-    check_extension!(Cap::Irqfd);
-    check_extension!(Cap::IrqRouting);
-    check_extension!(Cap::MpState);
-    check_extension!(Cap::SetIdentityMapAddr);
-    check_extension!(Cap::SetTssAddr);
-    check_extension!(Cap::SplitIrqchip);
-    check_extension!(Cap::TscDeadlineTimer);
-    check_extension!(Cap::UserMemory);
-    check_extension!(Cap::UserNmi);
-    check_extension!(Cap::VcpuEvents);
-    check_extension!(Cap::Xsave);
+    check_extension!(kvm, Cap::AdjustClock);
+    check_extension!(kvm, Cap::ExtCpuid);
+    check_extension!(kvm, Cap::GetTscKhz);
+    check_extension!(kvm, Cap::ImmediateExit);
+    check_extension!(kvm, Cap::Ioeventfd);
+    check_extension!(kvm, Cap::Irqchip);
+    check_extension!(kvm, Cap::Irqfd);
+    check_extension!(kvm, Cap::IrqRouting);
+    check_extension!(kvm, Cap::MpState);
+    check_extension!(kvm, Cap::SetIdentityMapAddr);
+    check_extension!(kvm, Cap::SetTssAddr);
+    check_extension!(kvm, Cap::SplitIrqchip);
+    check_extension!(kvm, Cap::TscDeadlineTimer);
+    check_extension!(kvm, Cap::UserMemory);
+    check_extension!(kvm, Cap::UserNmi);
+    check_extension!(kvm, Cap::VcpuEvents);
+    check_extension!(kvm, Cap::Xsave2);
+    Ok(())
+}
+
+#[cfg(feature = "sev_snp")]
+/// Check KVM extensions required for SEV-SNP.
+pub fn check_required_sev_snp_extensions(vm: &VmFd) -> KvmResult<()> {
+    check_extension!(vm, Cap::GuestMemfd);
+    // MEMORY_ATTRIBUTES is a bit mask and requires special handling.
+    let check_result = vm.check_extension_int(Cap::MemoryAttributes);
+    if check_result <= 0 {
+        return Err(KvmError::CapabilityMissing(Cap::MemoryAttributes));
+    }
+    let memory_attributes = check_result as u32;
+    if memory_attributes & KVM_MEMORY_ATTRIBUTE_PRIVATE == 0 {
+        return Err(KvmError::MemoryAttributePrivateMissing(memory_attributes));
+    }
+    check_extension!(vm, Cap::UserMemory2);
     Ok(())
 }
 
@@ -299,41 +314,6 @@ impl From<MsrEntry> for kvm_msr_entry {
             data: e.data,
             ..Default::default()
         }
-    }
-}
-
-#[derive(Error, Debug)]
-pub enum XsaveStateError {
-    #[error("kvm_xsave extra field is not empty")]
-    XsaveExtraFieldNotEmpty,
-}
-
-impl From<kvm_xsave> for XsaveState {
-    fn from(value: kvm_xsave) -> Self {
-        // Check if kvm_xsave struct size is larger than region size, indicating extra data exists
-        assert_eq!(
-            size_of_val(&value),
-            size_of_val(&value.region),
-            "kvm_xsave extra field is not empty"
-        );
-        Self {
-            region: value.region,
-            extra: Vec::new(),
-        }
-    }
-}
-
-impl TryFrom<XsaveState> for kvm_xsave {
-    type Error = XsaveStateError;
-    fn try_from(value: XsaveState) -> Result<Self, Self::Error> {
-        if !value.extra.is_empty() {
-            error!("XsaveState extra field is not empty");
-            return Err(XsaveStateError::XsaveExtraFieldNotEmpty);
-        }
-        Ok(Self {
-            region: value.region,
-            extra: Default::default(),
-        })
     }
 }
 

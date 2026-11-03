@@ -6,7 +6,6 @@
 use std::sync::{Arc, Mutex};
 use std::{io, result};
 
-use byteorder::{ByteOrder, LittleEndian};
 use log::{debug, error};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -25,8 +24,8 @@ const MSIX_PBA_ENTRIES_MODULO: u64 = 8;
 const BITS_PER_PBA_ENTRY: usize = 64;
 const FUNCTION_MASK_BIT: u8 = 14;
 const MSIX_ENABLE_BIT: u8 = 15;
-const FUNCTION_MASK_MASK: u16 = (1 << FUNCTION_MASK_BIT) as u16;
-const MSIX_ENABLE_MASK: u16 = (1 << MSIX_ENABLE_BIT) as u16;
+const FUNCTION_MASK_MASK: u16 = 1u16 << FUNCTION_MASK_BIT;
+const MSIX_ENABLE_MASK: u16 = 1u16 << MSIX_ENABLE_BIT;
 pub const MSIX_TABLE_ENTRY_SIZE: usize = 16;
 pub const MSIX_CONFIG_ID: &str = "msix_config";
 
@@ -120,6 +119,7 @@ impl MaybeMutInterruptSourceGroup {
         vm: &dyn hypervisor::Vm,
     ) -> io::Result<()> {
         match self {
+            #[expect(clippy::panic, reason = "device programming error")]
             Self::Immutable(_) => panic!(
                 "Attempted to set a notifier of an immutable source.  You must mark your device as needing a mutable source by having sets_irqfd() return true."
             ),
@@ -300,7 +300,7 @@ impl MsixConfig {
                 };
 
                 debug!("MSI_R TABLE offset 0x{offset:x} data 0x{value:x}");
-                LittleEndian::write_u32(data, value);
+                data.copy_from_slice(&value.to_le_bytes());
             }
             8 => {
                 let value = match modulo_offset {
@@ -319,7 +319,7 @@ impl MsixConfig {
                 };
 
                 debug!("MSI_R TABLE offset 0x{offset:x} data 0x{value:x}");
-                LittleEndian::write_u64(data, value);
+                data.copy_from_slice(&value.to_le_bytes());
             }
             _ => {
                 debug!("invalid data length");
@@ -349,7 +349,7 @@ impl MsixConfig {
 
         match data.len() {
             4 => {
-                let value = LittleEndian::read_u32(data);
+                let value = u32::from_le_bytes(data.try_into().expect("data should be 4 bytes"));
                 match modulo_offset {
                     0x0 => self.table_entries[index].msg_addr_lo = value,
                     0x4 => self.table_entries[index].msg_addr_hi = value,
@@ -363,7 +363,7 @@ impl MsixConfig {
                 debug!("MSI_W TABLE offset 0x{offset:x} data 0x{value:x}");
             }
             8 => {
-                let value = LittleEndian::read_u64(data);
+                let value = u64::from_le_bytes(data.try_into().expect("data should be 8 bytes"));
                 match modulo_offset {
                     0x0 => {
                         self.table_entries[index].msg_addr_lo = (value & 0xffff_ffffu64) as u32;
@@ -460,7 +460,7 @@ impl MsixConfig {
                 };
 
                 debug!("MSI_R PBA offset 0x{offset:x} data 0x{value:x}");
-                LittleEndian::write_u32(data, value);
+                data.copy_from_slice(&value.to_le_bytes());
             }
             8 => {
                 let value: u64 = match modulo_offset {
@@ -472,7 +472,7 @@ impl MsixConfig {
                 };
 
                 debug!("MSI_R PBA offset 0x{offset:x} data 0x{value:x}");
-                LittleEndian::write_u64(data, value);
+                data.copy_from_slice(&value.to_le_bytes());
             }
             _ => {
                 debug!("invalid data length");
@@ -489,7 +489,7 @@ impl MsixConfig {
 
         let index: usize = (vector as usize) / BITS_PER_PBA_ENTRY;
         let shift: usize = (vector as usize) % BITS_PER_PBA_ENTRY;
-        let mut mask: u64 = (1 << shift) as u64;
+        let mut mask = 1u64 << shift;
 
         if reset {
             mask = !mask;
@@ -640,5 +640,64 @@ impl MsixCap {
         // The table takes 1 bit per entry modulo 8 bytes.
         let size = ((self.table_size() as u64 / 64) + 1) * 8;
         (self.pba_offset() as u64, size)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestInterruptSourceGroup;
+
+    impl InterruptSourceGroup for TestInterruptSourceGroup {
+        fn trigger(&self, _index: InterruptIndex) -> io::Result<()> {
+            unreachable!()
+        }
+
+        fn notifier(&self, _index: InterruptIndex) -> Option<EventFd> {
+            unreachable!()
+        }
+
+        fn update(
+            &self,
+            _index: InterruptIndex,
+            _config: InterruptSourceConfig,
+            _masked: bool,
+            _set_gsi: bool,
+        ) -> io::Result<()> {
+            unreachable!()
+        }
+
+        fn set_gsi(&self) -> io::Result<()> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn test_set_pba_bit() {
+        let mut config = MsixConfig::new(
+            MAX_MSIX_VECTORS_PER_DEVICE,
+            MaybeMutInterruptSourceGroup::Immutable(Arc::new(TestInterruptSourceGroup)),
+            0,
+            None,
+        )
+        .unwrap();
+
+        for vector in 0..MAX_MSIX_VECTORS_PER_DEVICE {
+            let index = usize::from(vector) / BITS_PER_PBA_ENTRY;
+            let mask = 1u64 << (usize::from(vector) % BITS_PER_PBA_ENTRY);
+
+            config.pba_entries.fill(0);
+            let mut expected = config.pba_entries.clone();
+            expected[index] = mask;
+            config.set_pba_bit(vector, false);
+            assert_eq!(config.pba_entries, expected, "Setting vector {vector}");
+
+            config.pba_entries.fill(u64::MAX);
+            let mut expected = config.pba_entries.clone();
+            expected[index] = !mask;
+            config.set_pba_bit(vector, true);
+            assert_eq!(config.pba_entries, expected, "Clearing vector {vector}");
+        }
     }
 }

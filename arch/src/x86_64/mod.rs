@@ -12,9 +12,6 @@ pub mod interrupts;
 pub mod layout;
 pub mod regs;
 
-#[cfg(feature = "tdx")]
-pub mod tdx;
-
 mod arch_capabilities_checks;
 mod helpers;
 mod hyperv_msrs;
@@ -38,8 +35,9 @@ use vm_memory::{
 };
 
 use crate::smbios::SmbiosConfig;
+use crate::x86_64::cpu_profile::CpuProfile;
 use crate::x86_64::cpu_profile::cpuid_adjustments::MissingCpuidEntriesError;
-use crate::{CpuProfile, GuestMemoryMmap, InitramfsConfig, RegionType, smbios};
+use crate::{GuestMemoryMmap, InitramfsConfig, RegionType, smbios};
 
 // While modern architectures support more than 255 CPUs via x2APIC,
 // legacy devices such as mptable support at most 254 CPUs.
@@ -72,19 +70,6 @@ const CACHE_CORE_IDS_SHIFT: u32 = 26;
 const CACHE_CORE_IDS_MASK: u32 = 0x3f;
 
 // KVM feature bits
-#[cfg(feature = "tdx")]
-const KVM_FEATURE_CLOCKSOURCE_BIT: u8 = 0;
-#[cfg(feature = "tdx")]
-const KVM_FEATURE_CLOCKSOURCE2_BIT: u8 = 3;
-#[cfg(feature = "tdx")]
-const KVM_FEATURE_CLOCKSOURCE_STABLE_BIT: u8 = 24;
-#[cfg(feature = "tdx")]
-const KVM_FEATURE_ASYNC_PF_BIT: u8 = 4;
-#[cfg(feature = "tdx")]
-const KVM_FEATURE_ASYNC_PF_VMEXIT_BIT: u8 = 10;
-#[cfg(feature = "tdx")]
-const KVM_FEATURE_STEAL_TIME_BIT: u8 = 5;
-
 const KVM_FEATURE_MSI_EXT_DEST_ID: u8 = 15;
 
 pub const _NSIG: i32 = 65;
@@ -106,10 +91,8 @@ const E820_RESERVED: u32 = 2;
 pub struct CpuidConfig {
     pub phys_bits: u8,
     pub kvm_hyperv: bool,
-    #[cfg(feature = "tdx")]
-    pub tdx: bool,
     pub amx: bool,
-    pub profile: CpuProfile,
+    pub cpuid_overrides: Vec<CpuidOverride>,
 }
 
 #[derive(Debug, Error)]
@@ -136,11 +119,11 @@ pub enum Error {
 
     /// Failed to set supported CPUs.
     #[error("Failed to set supported CPUs")]
-    SetSupportedCpusFailed(#[source] anyhow::Error),
+    SetSupportedCpusFailed(#[source] HypervisorCpuError),
 
     /// Cannot set the local interruption due to bad configuration.
     #[error("Cannot set the local interruption due to bad configuration")]
-    LocalIntConfiguration(#[source] anyhow::Error),
+    LocalIntConfiguration(#[source] HypervisorCpuError),
 
     /// Error setting up SMBIOS table
     #[error("Error setting up SMBIOS table")]
@@ -159,10 +142,6 @@ pub enum Error {
         "The selected CPU profile cannot be utilized because the host's CPUID entries are not compatible with the profile"
     )]
     CpuProfileCpuidIncompatibility,
-
-    /// Error because TDX cannot be enabled when a custom (non host) CPU profile has been selected
-    #[error("TDX cannot be enabled when a custom CPU profile has been selected")]
-    CpuProfileTdxIncompatibility,
 
     /// Error when trying to apply a CPU profile because a necessary CPUID entry was not found
     #[error(
@@ -192,6 +171,9 @@ pub enum Error {
     #[error("The selected CPU profile could not be utilized: failed to obtain feature MSRs")]
     CpuProfileFeatureMsrs(#[source] HypervisorError),
 
+    #[error("Custom CPU profiles are not supported by {0:?}")]
+    CpuProfileUnsupportedHypervisor(hypervisor::HypervisorType),
+
     // Error writing EBDA address
     #[error("Error writing EBDA address")]
     EbdaSetup(#[source] vm_memory::GuestMemoryError),
@@ -199,11 +181,6 @@ pub enum Error {
     // Error getting CPU TSC frequency
     #[error("Error getting CPU TSC frequency")]
     GetTscFrequency(#[source] HypervisorCpuError),
-
-    /// Error retrieving TDX capabilities through the hypervisor (kvm/mshv) API
-    #[cfg(feature = "tdx")]
-    #[error("Error retrieving TDX capabilities through the hypervisor API")]
-    TdxCapabilities(#[source] HypervisorError),
 
     /// Failed to configure E820 map for bzImage
     #[error("Failed to configure E820 map for bzImage")]
@@ -382,6 +359,68 @@ impl CpuidPatch {
         }
 
         false
+    }
+}
+
+/// Replaces all four registers of a CPUID leaf and subleaf.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CpuidOverride {
+    #[serde(
+        serialize_with = "serialize_u32_hex",
+        deserialize_with = "deserialize_u32_hex"
+    )]
+    pub leaf: u32,
+    #[serde(
+        serialize_with = "serialize_u32_hex",
+        deserialize_with = "deserialize_u32_hex"
+    )]
+    pub subleaf: u32,
+    #[serde(
+        serialize_with = "serialize_u32_hex",
+        deserialize_with = "deserialize_u32_hex"
+    )]
+    pub eax: u32,
+    #[serde(
+        serialize_with = "serialize_u32_hex",
+        deserialize_with = "deserialize_u32_hex"
+    )]
+    pub ebx: u32,
+    #[serde(
+        serialize_with = "serialize_u32_hex",
+        deserialize_with = "deserialize_u32_hex"
+    )]
+    pub ecx: u32,
+    #[serde(
+        serialize_with = "serialize_u32_hex",
+        deserialize_with = "deserialize_u32_hex"
+    )]
+    pub edx: u32,
+}
+
+fn apply_cpuid_overrides(cpuid: &mut Vec<CpuIdEntry>, overrides: &[CpuidOverride]) {
+    for over in overrides {
+        let mut found = false;
+        for entry in cpuid.iter_mut() {
+            if entry.function == over.leaf && entry.index == over.subleaf {
+                entry.eax = over.eax;
+                entry.ebx = over.ebx;
+                entry.ecx = over.ecx;
+                entry.edx = over.edx;
+                found = true;
+            }
+        }
+
+        if !found {
+            cpuid.push(CpuIdEntry {
+                function: over.leaf,
+                index: over.subleaf,
+                flags: CPUID_FLAG_VALID_INDEX,
+                eax: over.eax,
+                ebx: over.ebx,
+                ecx: over.ecx,
+                edx: over.edx,
+            });
+        }
     }
 }
 
@@ -688,14 +727,17 @@ impl CpuidFeatureEntry {
 ///
 /// ## CPU profiles
 ///
-/// This function takes the CPU profile given in `config` into account and returns compatible CPUID entries
-/// if possible.
+/// This function applies `cpu_profile` and returns compatible CPUID entries if possible.
+/// Passing `None` uses the host profile.
 ///
 /// An error is returned when the CPUID entries obtained from the hypervisor do not satisfy the requirements
 /// to apply the selected CPU profile.
+///
+/// Overrides are applied after the selected CPU profile and common updates.
 pub fn generate_common_cpuid(
     hypervisor: &dyn hypervisor::Hypervisor,
     config: &CpuidConfig,
+    cpu_profile: Option<&CpuProfile>,
 ) -> super::Result<Vec<CpuIdEntry>> {
     #[allow(unused_unsafe)]
     // SAFETY: cpuid called with valid leaves
@@ -719,20 +761,15 @@ pub fn generate_common_cpuid(
         config.phys_bits
     );
 
+    let is_non_host_profile = cpu_profile.is_some();
+    if is_non_host_profile {
+        cpu_profile::check_cpu_profile_support(hypervisor.hypervisor_type())?;
+    }
+
     // Supported CPUID
     let mut cpuid = hypervisor
         .get_supported_cpuid()
         .map_err(Error::CpuidGetSupported)?;
-
-    let is_non_host_profile = !matches!(config.profile, CpuProfile::Host);
-    #[cfg(feature = "tdx")]
-    if config.tdx {
-        if is_non_host_profile {
-            // TDX is not supported by CPU profiles other than host for the time being.
-            return Err(Error::CpuProfileTdxIncompatibility.into());
-        }
-        common_cpuid_tdx_configuration(&mut cpuid, hypervisor)?;
-    }
 
     // Copy CPU identification string
     for i in 0x8000_0002..=0x8000_0004 {
@@ -750,9 +787,8 @@ pub fn generate_common_cpuid(
         });
     }
 
-    let cpuid_profile = if is_non_host_profile {
-        let cpuid_profile = config
-            .profile
+    let cpuid_profile = if let Some(cpu_profile) = cpu_profile {
+        let cpuid_profile = cpu_profile
             .adjust_cpuid(cpuid.clone(), config.amx, hypervisor.get_cpu_vendor())
             .map_err(Error::MissingExpectedCpuidEntry)?;
 
@@ -774,7 +810,7 @@ pub fn generate_common_cpuid(
     );
 
     // If we want to apply a CPU profile we need to check that it remains compatible with `cpuid_host`
-    if is_non_host_profile {
+    let mut cpuid = if is_non_host_profile {
         CpuidFeatureEntry::check_cpuid_compatibility_with_descriptions(
             &cpuid_profile,
             "CPU Profile",
@@ -782,10 +818,13 @@ pub fn generate_common_cpuid(
             "Host VM",
         )
         .map_err(|_| Error::CpuProfileCpuidIncompatibility)?;
-        Ok(cpuid_profile)
+        cpuid_profile
     } else {
-        Ok(cpuid_host)
-    }
+        cpuid_host
+    };
+
+    apply_cpuid_overrides(&mut cpuid, &config.cpuid_overrides);
+    Ok(cpuid)
 }
 
 /// Generates the MSR related updates that are required in order to be compatible with the given CPU profile (if any).
@@ -806,13 +845,15 @@ pub fn generate_common_cpuid(
 /// of what the host actually supports.
 pub fn generate_required_msr_updates(
     hypervisor: &dyn hypervisor::Hypervisor,
-    cpu_profile: CpuProfile,
+    cpu_profile: Option<&CpuProfile>,
     kvm_hyperv: bool,
     nested: bool,
 ) -> super::Result<Option<VcpuMsrConfigUpdate>> {
-    if matches!(cpu_profile, CpuProfile::Host) {
+    let Some(cpu_profile) = cpu_profile else {
         return Ok(None);
-    }
+    };
+
+    cpu_profile::check_cpu_profile_support(hypervisor.hypervisor_type())?;
 
     let host_supported_msrs = hypervisor
         .get_msr_index_list()
@@ -829,18 +870,16 @@ pub fn generate_required_msr_updates(
         nested,
     )?;
 
-    if let Some(required_updates) = &required_updates {
-        // If IA32_ARCH_CAPABILITIES is present then we need to check for compatibility.
-        // This MSR is only available on Intel CPUs as of now, but we do not check for vendor equality here.
-        //
-        // TODO: Consider adding a CPU vendor equality requirement to `check_cpuid_compatibility` even though
-        // it is extremely unlikely that CPUs from different vendors will pass the existing checks.
-        arch_capabilities_checks::valid_required_arch_capabilities_update(
-            required_updates,
-            &host_feature_msrs,
-        )?;
-    }
-    Ok(required_updates)
+    // If IA32_ARCH_CAPABILITIES is present then we need to check for compatibility.
+    // This MSR is only available on Intel CPUs as of now, but we do not check for vendor equality here.
+    //
+    // TODO: Consider adding a CPU vendor equality requirement to `check_cpuid_compatibility` even though
+    // it is extremely unlikely that CPUs from different vendors will pass the existing checks.
+    arch_capabilities_checks::valid_required_arch_capabilities_update(
+        &required_updates,
+        &host_feature_msrs,
+    )?;
+    Ok(Some(required_updates))
 }
 
 /// Apply updates to common CPUID (not vCPU specific) that are necessary regardless of
@@ -891,7 +930,7 @@ fn required_common_cpuid_updates(
     CpuidPatch::patch_cpuid(&mut cpuid, &cpuid_patches);
 
     // Update some existing CPUID
-    for entry in cpuid.as_mut_slice().iter_mut() {
+    for entry in cpuid.iter_mut() {
         #[allow(unused_unsafe)]
         match entry.function {
             // Clear AMX related bits if the AMX feature is not enabled
@@ -961,17 +1000,6 @@ fn required_common_cpuid_updates(
                 // Enable KVM_FEATURE_MSI_EXT_DEST_ID. This allows the guest to target
                 // device interrupts to cpus with APIC IDs > 254 without interrupt remapping.
                 entry.eax |= 1 << KVM_FEATURE_MSI_EXT_DEST_ID;
-
-                // These features are not supported by TDX
-                #[cfg(feature = "tdx")]
-                if config.tdx {
-                    entry.eax &= !((1 << KVM_FEATURE_CLOCKSOURCE_BIT)
-                        | (1 << KVM_FEATURE_CLOCKSOURCE2_BIT)
-                        | (1 << KVM_FEATURE_CLOCKSOURCE_STABLE_BIT)
-                        | (1 << KVM_FEATURE_ASYNC_PF_BIT)
-                        | (1 << KVM_FEATURE_ASYNC_PF_VMEXIT_BIT)
-                        | (1 << KVM_FEATURE_STEAL_TIME_BIT));
-                }
             }
             _ => {}
         }
@@ -1040,35 +1068,6 @@ fn required_common_cpuid_updates(
     }
 
     cpuid
-}
-
-#[cfg(feature = "tdx")]
-fn common_cpuid_tdx_configuration(
-    cpuid: &mut [CpuIdEntry],
-    hypervisor: &dyn hypervisor::Hypervisor,
-) -> super::Result<()> {
-    let caps = hypervisor
-        .tdx_capabilities()
-        .map_err(Error::TdxCapabilities)?;
-    info!("TDX capabilities {caps:#?}");
-
-    for entry in cpuid.iter_mut().filter(|entry| entry.function == 0xd) {
-        let xcr0_mask: u64 = 0x82ff;
-        let xss_mask: u64 = !xcr0_mask;
-        if entry.index == 0 {
-            entry.eax &= (caps.xfam_fixed0 as u32) & (xcr0_mask as u32);
-            entry.eax |= (caps.xfam_fixed1 as u32) & (xcr0_mask as u32);
-            entry.edx &= ((caps.xfam_fixed0 & xcr0_mask) >> 32) as u32;
-            entry.edx |= ((caps.xfam_fixed1 & xcr0_mask) >> 32) as u32;
-        } else if entry.index == 1 {
-            entry.ecx &= (caps.xfam_fixed0 as u32) & (xss_mask as u32);
-            entry.ecx |= (caps.xfam_fixed1 as u32) & (xss_mask as u32);
-            entry.edx &= ((caps.xfam_fixed0 & xss_mask) >> 32) as u32;
-            entry.edx |= ((caps.xfam_fixed1 & xss_mask) >> 32) as u32;
-        }
-    }
-
-    Ok(())
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -1145,7 +1144,7 @@ pub fn configure_vcpu(
     }
 
     vcpu.set_cpuid2(&cpuid)
-        .map_err(|e| Error::SetSupportedCpusFailed(e.into()))?;
+        .map_err(Error::SetSupportedCpusFailed)?;
 
     if kvm_hyperv {
         vcpu.enable_hyperv_synic().unwrap();
@@ -1167,7 +1166,7 @@ pub fn configure_vcpu(
         }
         regs::setup_fpu(vcpu).map_err(Error::FpuConfiguration)?;
     }
-    interrupts::set_lint(vcpu).map_err(|e| Error::LocalIntConfiguration(e.into()))?;
+    interrupts::set_lint(vcpu).map_err(Error::LocalIntConfiguration)?;
     Ok(())
 }
 
@@ -1353,13 +1352,27 @@ pub fn generate_ram_ranges(guest_mem: &GuestMemoryMmap) -> super::Result<Vec<Ram
     Ok(ram_ranges)
 }
 
-/// The reserved ranges of the guest memory map, as (base, size).
-fn reserved_regions() -> Vec<(u64, u64)> {
-    arch_memory_regions()
-        .into_iter()
-        .filter(|(_, _, r_type)| *r_type == RegionType::Reserved)
-        .map(|(base, size, _)| (base.raw_value(), size as u64))
-        .collect()
+/// Generate the E820 entries shared by direct boot and fw_cfg.
+/// Each entry is (base, size, type).
+pub fn generate_e820_memory_map(
+    guest_mem: &GuestMemoryMmap,
+) -> super::Result<Vec<(u64, u64, u32)>> {
+    let mut entries = vec![(0, layout::EBDA_START.0, E820_RAM)];
+    entries.extend(
+        generate_ram_ranges(guest_mem)?
+            .into_iter()
+            .map(|(start, end)| (start, end - start, E820_RAM)),
+    );
+    entries.extend(
+        arch_memory_regions()
+            .into_iter()
+            // Leave the PCI BAR window out of E820 so Linux can allocate
+            // resources for hotplugged devices within it.
+            .filter(|(_, _, r_type)| *r_type == RegionType::Reserved)
+            .map(|(base, size, _)| (base.0, size as u64, E820_RESERVED)),
+    );
+    entries.sort_unstable_by_key(|entry| entry.0);
+    Ok(entries)
 }
 
 fn configure_pvh(
@@ -1405,28 +1418,8 @@ fn configure_pvh(
     // at MEMMAP_START after all of the mappings are recorded.
     let mut memmap: Vec<hvm_memmap_table_entry> = Vec::new();
 
-    // Create the memory map entries.
-    add_memmap_entry(&mut memmap, 0, layout::EBDA_START.raw_value(), E820_RAM);
-
-    // Get usable physical memory ranges
-    let ram_ranges = generate_ram_ranges(guest_mem)?;
-
-    // Create e820 memory map entries
-    for ram_range in ram_ranges {
-        info!(
-            "create_memmap_entry, start: 0x{:08x}, end: 0x{:08x}",
-            ram_range.0, ram_range.1
-        );
-        add_memmap_entry(
-            &mut memmap,
-            ram_range.0,
-            ram_range.1 - ram_range.0,
-            E820_RAM,
-        );
-    }
-
-    for (base, size) in reserved_regions() {
-        add_memmap_entry(&mut memmap, base, size, E820_RESERVED);
+    for (base, size, type_) in generate_e820_memory_map(guest_mem)? {
+        add_memmap_entry(&mut memmap, base, size, type_);
     }
 
     start_info.memmap_entries = memmap.len() as u32;
@@ -1496,16 +1489,9 @@ fn configure_32bit_entry(
         params.hdr.ramdisk_size = initramfs_config.size as u32;
     }
 
-    add_e820_entry(&mut params, 0, layout::EBDA_START.raw_value(), E820_RAM)?;
-
-    for (start, end) in generate_ram_ranges(guest_mem)? {
-        add_e820_entry(&mut params, start, end - start, E820_RAM)?;
+    for (base, size, type_) in generate_e820_memory_map(guest_mem)? {
+        add_e820_entry(&mut params, base, size, type_)?;
     }
-
-    for (base, size) in reserved_regions() {
-        add_e820_entry(&mut params, base, size, E820_RESERVED)?;
-    }
-
     if let Some(rsdp_addr) = rsdp_addr {
         params.acpi_rsdp_addr = rsdp_addr.0;
     }
@@ -1773,6 +1759,89 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_cpuid_override_existing_entries() {
+        let entry = CpuIdEntry {
+            function: 7,
+            index: 0,
+            flags: CPUID_FLAG_VALID_INDEX,
+            eax: 1,
+            ebx: 2,
+            ecx: 3,
+            edx: 4,
+        };
+        let other_subleaf = CpuIdEntry { index: 1, ..entry };
+        let other_leaf = CpuIdEntry {
+            function: 1,
+            ..entry
+        };
+        let mut cpuid = vec![entry, other_subleaf, other_leaf, entry];
+        let over = CpuidOverride {
+            leaf: 7,
+            subleaf: 0,
+            eax: 5,
+            ebx: 6,
+            ecx: 7,
+            edx: 8,
+        };
+
+        apply_cpuid_overrides(&mut cpuid, &[over]);
+        let expected = CpuIdEntry {
+            eax: 5,
+            ebx: 6,
+            ecx: 7,
+            edx: 8,
+            ..entry
+        };
+        assert_eq!(cpuid, vec![expected, other_subleaf, other_leaf, expected]);
+        apply_cpuid_overrides(&mut cpuid, &[]);
+        assert_eq!(cpuid, vec![expected, other_subleaf, other_leaf, expected]);
+    }
+
+    #[test]
+    fn test_cpuid_override_new_entries_and_duplicates() {
+        let over = CpuidOverride {
+            leaf: 7,
+            subleaf: 0,
+            eax: 1,
+            ebx: 2,
+            ecx: 3,
+            edx: 4,
+        };
+        let mut cpuid = Vec::new();
+        apply_cpuid_overrides(
+            &mut cpuid,
+            &[
+                over,
+                CpuidOverride { subleaf: 1, ..over },
+                CpuidOverride { eax: 5, ..over },
+            ],
+        );
+        assert_eq!(
+            cpuid,
+            vec![
+                CpuIdEntry {
+                    function: 7,
+                    index: 0,
+                    flags: CPUID_FLAG_VALID_INDEX,
+                    eax: 5,
+                    ebx: 2,
+                    ecx: 3,
+                    edx: 4,
+                },
+                CpuIdEntry {
+                    function: 7,
+                    index: 1,
+                    flags: CPUID_FLAG_VALID_INDEX,
+                    eax: 1,
+                    ebx: 2,
+                    ecx: 3,
+                    edx: 4,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn regions_base_addr() {
         let regions = arch_memory_regions();
         assert_eq!(6, regions.len());
@@ -1870,6 +1939,47 @@ mod tests {
             None,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn test_generate_e820_memory_map() {
+        let gm = GuestMemoryMmap::from_ranges(&[
+            (GuestAddress(0), 2 << 20),
+            (layout::RAM_64BIT_START, 2 << 20),
+            (layout::RAM_64BIT_START.unchecked_add(4 << 20), 2 << 20),
+            (
+                layout::AMD_HYPER_TRANSPORT_HOLE_START
+                    .unchecked_add(layout::AMD_HYPER_TRANSPORT_HOLE_SIZE),
+                2 << 20,
+            ),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            generate_e820_memory_map(&gm).unwrap(),
+            vec![
+                (0, layout::EBDA_START.0, E820_RAM),
+                (layout::HIGH_RAM_START.0, 1 << 20, E820_RAM),
+                (
+                    layout::PCI_MMCONFIG_START.0,
+                    layout::PCI_MMCONFIG_SIZE,
+                    E820_RESERVED,
+                ),
+                (layout::RAM_64BIT_START.0, 2 << 20, E820_RAM),
+                (layout::RAM_64BIT_START.0 + (4 << 20), 2 << 20, E820_RAM),
+                (
+                    layout::AMD_HYPER_TRANSPORT_HOLE_START.0,
+                    layout::AMD_HYPER_TRANSPORT_HOLE_SIZE,
+                    E820_RESERVED,
+                ),
+                (
+                    layout::AMD_HYPER_TRANSPORT_HOLE_START.0
+                        + layout::AMD_HYPER_TRANSPORT_HOLE_SIZE,
+                    2 << 20,
+                    E820_RAM,
+                ),
+            ]
+        );
     }
 
     #[test]

@@ -98,10 +98,10 @@
 
 use std::cmp::max;
 use std::io::{Read, Write};
+use std::iter;
 use std::ops::RangeInclusive;
 
 use anyhow::anyhow;
-use itertools::Itertools;
 use log::error;
 use serde::{Deserialize, Serialize};
 use zerocopy::{FromBytes, Immutable, IntoBytes, TryFromBytes};
@@ -146,8 +146,6 @@ pub enum Command {
     /// Finalizes the migration and resumes the VM on the destination.
     /// Sent when the source VM was running at migration time.
     Complete = 5,
-    #[deprecated = "v52 was the last version to send this command: we now rely on proper timeout and EOF handling on the destination"]
-    Abandon = 6,
     MemoryFd = 7,
     /// Finalizes the migration without resuming the VM on the destination.
     /// Sent when the source VM was paused at migration time.
@@ -294,7 +292,10 @@ impl Request {
         // The protocol version is stored in the first two header bytes, the remaining bytes are ignored.
         let sender_version = u16::from_le_bytes([self.command_headers[0], self.command_headers[1]]);
         if !supported_protocol_versions().any(|version| version == sender_version) {
-            let supported_versions = supported_protocol_versions().join(", ");
+            let supported_versions = supported_protocol_versions()
+                .map(|version| version.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
             return Err(MigratableError::MigrateReceive(anyhow!(
                 "Migration protocol version {sender_version} of sender doesn't match any supported version: {supported_versions}"
             )));
@@ -429,7 +430,7 @@ impl MemoryRange {
 }
 
 /// A set of guest-memory ranges to transfer as one migration payload.
-#[derive(Clone, Default, Debug, Serialize, Deserialize)]
+#[derive(Clone, Default, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryRangeTable {
     data: Vec<MemoryRange>,
 }
@@ -450,23 +451,19 @@ impl MemoryRangeTable {
         start_addr: u64,
         page_size: u64,
     ) -> impl Iterator<Item = MemoryRange> {
-        bitmap
-            .into_iter()
-            .bit_positions()
-            // Turn them into single-element ranges for coalesce.
-            .map(|b| b..(b + 1))
-            // Merge adjacent ranges.
-            .coalesce(|prev, curr| {
-                if prev.end == curr.start {
-                    Ok(prev.start..curr.end)
-                } else {
-                    Err((prev, curr))
-                }
+        let mut pages = bitmap.into_iter().bit_positions().peekable();
+        iter::from_fn(move || {
+            let first = pages.next()?;
+            // Merge adjacent dirty pages.
+            let mut end = first + 1;
+            while pages.next_if_eq(&end).is_some() {
+                end += 1;
+            }
+            Some(MemoryRange {
+                gpa: start_addr + first * page_size,
+                length: (end - first) * page_size,
             })
-            .map(move |r| MemoryRange {
-                gpa: start_addr + r.start * page_size,
-                length: (r.end - r.start) * page_size,
-            })
+        })
     }
 
     /// Creates a new [`MemoryRangeTable`] from a bitmap (represented as
@@ -498,12 +495,22 @@ impl MemoryRangeTable {
         &self.data
     }
 
+    /// Sorts the ranges by guest address.
+    pub fn sort(&mut self) {
+        self.data.sort_unstable_by_key(|range| range.gpa);
+    }
+
     pub fn push(&mut self, range: MemoryRange) {
         self.data.push(range);
     }
 
     pub fn read_from(fd: &mut dyn Read, length: u64) -> Result<MemoryRangeTable, MigratableError> {
-        assert!((length as usize).is_multiple_of(size_of::<MemoryRange>()));
+        if !(length as usize).is_multiple_of(size_of::<MemoryRange>()) {
+            return Err(MigratableError::MigrateReceive(anyhow!(
+                "Memory range table size {length} must be a multiple of MemoryRange size {}",
+                size_of::<MemoryRange>()
+            )));
+        }
 
         let mut data: Vec<MemoryRange> =
             vec![MemoryRange::default(); length as usize / size_of::<MemoryRange>()];
@@ -518,9 +525,8 @@ impl MemoryRangeTable {
         (size_of::<MemoryRange>() * self.data.len()) as u64
     }
 
-    pub fn write_to(&self, fd: &mut dyn Write) -> Result<(), MigratableError> {
-        fd.write_all(self.data.as_bytes())
-            .map_err(MigratableError::MigrateSocket)
+    pub fn as_bytes(&self) -> &[u8] {
+        self.data.as_bytes()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -533,6 +539,7 @@ impl MemoryRangeTable {
 
     /// Merges `self` and `other` and combines adjacent and overlapping ranges
     /// into a continuous and sorted table.
+    #[must_use]
     pub fn merge(mut self, other: Self) -> Self {
         self.data.extend(other.data);
         // Faster than sort_unstable() as both ranges are mostly sorted already.
@@ -654,6 +661,20 @@ mod tests {
     };
 
     #[test]
+    fn test_memory_range_table_incorrect_length() {
+        let mut fd = Cursor::new(vec![0u8; 8]);
+        MemoryRangeTable::read_from(&mut fd, 7).unwrap_err();
+
+        let bytes = MemoryRangeTable::from(&[(0x1000u64, 0x2000u64)])
+            .as_bytes()
+            .to_vec();
+        let len = bytes.len() as u64;
+        let mut fd = Cursor::new(bytes);
+        let table = MemoryRangeTable::read_from(&mut fd, len).unwrap();
+        assert_eq!(table.as_bytes().len() as u64, len);
+    }
+
+    #[test]
     fn test_start_request_ignores_residual_command_headers_bytes() {
         let request = Request {
             command: Command::Start,
@@ -747,6 +768,37 @@ mod tests {
                 ]
             );
         }
+    }
+
+    #[test]
+    fn test_memory_range_table_from_dirty_bitmap_edge_cases() {
+        let page_size = 0x1000;
+        let start_gpa = 0x10000;
+
+        // Without dirty pages there must be no range, not even an empty one.
+        assert!(MemoryRangeTable::from_dirty_bitmap([], start_gpa, page_size).is_empty());
+        assert!(MemoryRangeTable::from_dirty_bitmap([0, 0], start_gpa, page_size).is_empty());
+
+        // The run only ends with the bitmap, so the last range must still be
+        // emitted, and as one range across the u64 boundary.
+        let full = MemoryRangeTable::from_dirty_bitmap([u64::MAX, u64::MAX], start_gpa, page_size);
+        assert_eq!(
+            full.ranges(),
+            &[MemoryRange {
+                gpa: start_gpa,
+                length: 128 * page_size,
+            }]
+        );
+        // The last bit of the first u64 and the first bit of the second are
+        // the adjacent pages 63 and 64, so they form one range.
+        let straddling = MemoryRangeTable::from_dirty_bitmap([1 << 63, 1], start_gpa, page_size);
+        assert_eq!(
+            straddling.ranges(),
+            &[MemoryRange {
+                gpa: start_gpa + 63 * page_size,
+                length: 2 * page_size,
+            }]
+        );
     }
 
     /// Appending multiple bitmaps must yield the same table as merging the

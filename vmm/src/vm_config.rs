@@ -3,21 +3,25 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 use std::collections::HashSet;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 #[cfg(feature = "fw_cfg")]
 use std::str::FromStr;
-use std::{fmt, fs, result};
+use std::{fmt, fs, io, result};
 
-use arch::CpuProfile;
+use arch::CpuProfileConfig;
+#[cfg(target_arch = "x86_64")]
+use arch::CpuidOverride;
 use block::ImageType;
 pub use block::fcntl::LockGranularityChoice;
 #[cfg(target_arch = "x86_64")]
 use devices::debug_console;
+use landlock::AccessFs;
 use log::{debug, warn};
 use net_util::MacAddr;
 use serde::de::{Error as DeError, Visitor};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 use virtio_devices::RateLimiterConfig;
 
@@ -91,7 +95,14 @@ pub struct CpusConfig {
     pub core_scheduling: CoreScheduling,
     // Defaults to "Host" if no profile is given.
     #[serde(default)]
-    pub profile: CpuProfile,
+    pub profile: CpuProfileConfig,
+    #[cfg(target_arch = "x86_64")]
+    #[serde(
+        default,
+        rename = "x-cpuid-overrides",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub cpuid_overrides: Vec<CpuidOverride>,
 }
 
 pub const DEFAULT_VCPUS: u32 = 1;
@@ -108,7 +119,9 @@ impl Default for CpusConfig {
             features: CpuFeatures::default(),
             nested: false,
             core_scheduling: CoreScheduling::default(),
-            profile: CpuProfile::default(),
+            profile: CpuProfileConfig::default(),
+            #[cfg(target_arch = "x86_64")]
+            cpuid_overrides: Vec::new(),
         }
     }
 }
@@ -136,9 +149,9 @@ pub struct PlatformConfig {
     pub iommu_segments: Option<Box<[u16]>>,
     #[serde(default = "default_platformconfig_iommu_address_width_bits")]
     pub iommu_address_width_bits: u8,
-    #[serde(default, alias = "serial_number")]
+    #[serde(default)]
     pub system_serial_number: Option<String>,
-    #[serde(default, alias = "uuid")]
+    #[serde(default)]
     pub system_uuid: Option<String>,
     #[serde(default)]
     pub oem_strings: Option<Box<[String]>>,
@@ -154,17 +167,14 @@ pub struct PlatformConfig {
     pub system_sku_number: Option<String>,
     #[serde(default)]
     pub chassis_asset_tag: Option<String>,
-    #[cfg(feature = "tdx")]
-    #[serde(default)]
-    pub tdx: bool,
     #[cfg(feature = "sev_snp")]
     #[serde(default)]
     pub sev_snp: bool,
     #[serde(default)]
     pub iommufd: bool,
-    // FDs are not serialized and any deserialized value is invalid; see NetConfig::fds.
-    #[serde(default, deserialize_with = "deserialize_platformconfig_iommufd_fd")]
-    pub iommufd_fd: Option<i32>,
+    // Deserialized FD numbers carry no ownership and are discarded.
+    #[serde(skip_deserializing)]
+    pub iommufd_fd: Option<RawFd>,
     #[serde(default = "default_platformconfig_vfio_p2p_dma")]
     pub vfio_p2p_dma: bool,
 }
@@ -210,21 +220,6 @@ impl PlatformConfig {
         };
 
         (!smbios.is_empty()).then_some(smbios)
-    }
-}
-
-fn deserialize_platformconfig_iommufd_fd<'de, D>(d: D) -> Result<Option<i32>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let invalid_fd: Option<i32> = Option::deserialize(d)?;
-    if invalid_fd.is_some() {
-        debug!(
-            "FD in 'PlatformConfig::iommufd_fd' won't be deserialized as it is most likely invalid now. Deserializing it as -1."
-        );
-        Ok(Some(-1))
-    } else {
-        Ok(None)
     }
 }
 
@@ -456,7 +451,7 @@ pub struct DiskConfig {
     #[serde(default)]
     pub direct: bool,
     #[serde(default = "default_diskconfig_num_queues")]
-    pub num_queues: usize,
+    pub num_queues: u16,
     #[serde(default = "default_diskconfig_queue_size")]
     pub queue_size: u16,
     #[serde(default)]
@@ -491,15 +486,15 @@ pub struct DiskConfig {
 impl ApplyLandlock for DiskConfig {
     fn apply_landlock(&self, landlock: &mut Landlock) -> LandlockResult<()> {
         if let Some(path) = &self.path {
-            landlock.add_rule_with_access(path, "rw")?;
+            landlock.add_rule_with_access(path, if self.readonly { "r" } else { "rw" })?;
         }
         Ok(())
     }
 }
 
-pub const DEFAULT_DISK_NUM_QUEUES: usize = 1;
+pub const DEFAULT_DISK_NUM_QUEUES: u16 = 1;
 
-pub fn default_diskconfig_num_queues() -> usize {
+pub fn default_diskconfig_num_queues() -> u16 {
     DEFAULT_DISK_NUM_QUEUES
 }
 
@@ -529,7 +524,7 @@ pub struct NetConfig {
     #[serde(default)]
     pub mtu: Option<u16>,
     #[serde(default = "default_netconfig_num_queues")]
-    pub num_queues: usize,
+    pub num_queues: u16,
     #[serde(default = "default_netconfig_queue_size")]
     pub queue_size: u16,
     #[serde(default)]
@@ -544,7 +539,7 @@ pub struct NetConfig {
     // Valid FDs are transmitted via a different channel (SCM_RIGHTS message)
     // and will be populated into this struct on the destination VMM eventually.
     #[serde(default, deserialize_with = "deserialize_netconfig_fds")]
-    pub fds: Option<Vec<i32>>,
+    pub fds: Option<Vec<RawFd>>,
     #[serde(default)]
     pub rate_limiter_config: Option<RateLimiterConfig>,
     #[serde(default)]
@@ -559,9 +554,9 @@ pub fn default_netconfig_tap() -> Option<String> {
     None
 }
 
-pub const DEFAULT_NET_NUM_QUEUES: usize = 2;
+pub const DEFAULT_NET_NUM_QUEUES: u16 = 2;
 
-pub fn default_netconfig_num_queues() -> usize {
+pub fn default_netconfig_num_queues() -> u16 {
     DEFAULT_NET_NUM_QUEUES
 }
 
@@ -571,11 +566,11 @@ pub fn default_netconfig_queue_size() -> u16 {
     DEFAULT_NET_QUEUE_SIZE
 }
 
-fn deserialize_netconfig_fds<'de, D>(d: D) -> Result<Option<Vec<i32>>, D::Error>
+fn deserialize_netconfig_fds<'de, D>(d: D) -> Result<Option<Vec<RawFd>>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let invalid_fds: Option<Vec<i32>> = Option::deserialize(d)?;
+    let invalid_fds: Option<Vec<RawFd>> = Option::deserialize(d)?;
     if let Some(invalid_fds) = invalid_fds {
         debug!(
             "FDs in 'NetConfig' won't be deserialized as they are most likely invalid now. Deserializing them as -1."
@@ -644,12 +639,12 @@ pub struct FsConfig {
     pub tag: String,
     pub socket: PathBuf,
     #[serde(default = "default_fsconfig_num_queues")]
-    pub num_queues: usize,
+    pub num_queues: u16,
     #[serde(default = "default_fsconfig_queue_size")]
     pub queue_size: u16,
 }
 
-pub fn default_fsconfig_num_queues() -> usize {
+pub fn default_fsconfig_num_queues() -> u16 {
     1
 }
 
@@ -707,7 +702,37 @@ pub enum ConsoleOutputMode {
     Tty,
     File,
     Socket,
+    Tcp,
     Null,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TcpConsoleConfig {
+    #[serde(deserialize_with = "deserialize_tcp_address")]
+    pub address: SocketAddr,
+    /// Client mode is not supported.
+    #[serde(default = "TcpConsoleConfig::default_server")]
+    pub server: bool,
+}
+
+pub(crate) fn parse_tcp_address(address: &str) -> io::Result<SocketAddr> {
+    address
+        .parse()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
+}
+
+fn deserialize_tcp_address<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<SocketAddr, D::Error> {
+    let address = String::deserialize(deserializer)?;
+    parse_tcp_address(&address).map_err(DeError::custom)
+}
+
+impl TcpConsoleConfig {
+    fn default_server() -> bool {
+        true
+    }
 }
 
 /// Common configuration for plain console configs.
@@ -721,6 +746,8 @@ pub struct CommonConsoleConfig {
     pub mode: ConsoleOutputMode,
     #[serde(default)]
     pub socket: Option<PathBuf>,
+    #[serde(default)]
+    pub tcp: Option<TcpConsoleConfig>,
 }
 
 impl ApplyLandlock for CommonConsoleConfig {
@@ -747,7 +774,7 @@ pub struct SerialConfig {
 }
 
 impl SerialConfig {
-    pub const SYNTAX: &str = "Control serial port: \"off|null|pty|tty|file=<path>|socket=<path>\"";
+    pub const SYNTAX: &str = "Control serial port: \"off|null|pty|tty|file=<path>|socket=<path>|tcp=<loopback_ip>:<port>,server=on\"";
 }
 
 impl Default for SerialConfig {
@@ -757,6 +784,7 @@ impl Default for SerialConfig {
                 file: None,
                 mode: ConsoleOutputMode::Null,
                 socket: None,
+                tcp: None,
             },
         }
     }
@@ -778,7 +806,7 @@ pub struct ConsoleConfig {
 }
 
 impl ConsoleConfig {
-    pub const SYNTAX: &str = "Control (virtio) console: \"off|null|pty|tty|file=<path>|socket=<path>,iommu=on|off,id=<device_id>,pci_segment=<segment_id>,pci_device_id=<pci_slot>\"";
+    pub const SYNTAX: &str = "Control (virtio) console: \"off|null|pty|tty|file=<path>|socket=<path>|tcp=<loopback_ip>:<port>,server=on,iommu=on|off,id=<device_id>,pci_segment=<segment_id>,pci_device_id=<pci_slot>\"";
 }
 
 impl Default for ConsoleConfig {
@@ -788,6 +816,7 @@ impl Default for ConsoleConfig {
                 file: None,
                 mode: ConsoleOutputMode::Tty,
                 socket: None,
+                tcp: None,
             },
             pci_common: PciDeviceCommonConfig::default(),
         }
@@ -842,30 +871,15 @@ pub struct DeviceConfig {
     pub pci_common: PciDeviceCommonConfig,
     #[serde(default)]
     pub path: Option<PathBuf>,
-    // FDs are not serialized and any deserialized value is invalid; see NetConfig::fds.
-    #[serde(default, deserialize_with = "deserialize_deviceconfig_fd")]
-    pub fd: Option<i32>,
+    // Deserialized FD numbers carry no ownership and are discarded.
+    #[serde(skip_deserializing)]
+    pub fd: Option<RawFd>,
     #[serde(default)]
     pub x_nv_gpudirect_clique: Option<u8>,
     #[serde(default)]
     pub x_exclude_mmap_bars: Vec<u64>,
     #[serde(skip)]
     pub iommufd_dev_id: Option<u32>,
-}
-
-fn deserialize_deviceconfig_fd<'de, D>(d: D) -> Result<Option<i32>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let invalid_fd: Option<i32> = Option::deserialize(d)?;
-    if invalid_fd.is_some() {
-        debug!(
-            "FD in 'DeviceConfig' won't be deserialized as it is most likely invalid now. Deserializing it as -1."
-        );
-        Ok(Some(-1))
-    } else {
-        Ok(None)
-    }
 }
 
 impl ApplyLandlock for DeviceConfig {
@@ -910,10 +924,10 @@ pub struct VdpaConfig {
     pub pci_common: PciDeviceCommonConfig,
     pub path: PathBuf,
     #[serde(default = "default_vdpaconfig_num_queues")]
-    pub num_queues: usize,
+    pub num_queues: u16,
 }
 
-pub fn default_vdpaconfig_num_queues() -> usize {
+pub fn default_vdpaconfig_num_queues() -> u16 {
     1
 }
 
@@ -935,7 +949,7 @@ pub struct VsockConfig {
 impl ApplyLandlock for VsockConfig {
     fn apply_landlock(&self, landlock: &mut Landlock) -> LandlockResult<()> {
         if let Some(parent) = self.socket.parent() {
-            landlock.add_rule_with_access(parent, "w")?;
+            landlock.add_rule(parent, AccessFs::MakeSock.into())?;
         }
 
         landlock.add_rule_with_access(&self.socket, "rw")?;
@@ -1067,7 +1081,7 @@ pub struct FwCfgConfig {
 impl Default for FwCfgConfig {
     fn default() -> Self {
         FwCfgConfig {
-            e820: true,
+            e820: cfg!(target_arch = "x86_64"),
             kernel: true,
             cmdline: true,
             initramfs: true,
@@ -1170,6 +1184,14 @@ impl PayloadConfig {
         #[cfg(feature = "fw_cfg")]
         if let Some(fw_cfg_config) = &self.fw_cfg_config {
             fw_cfg_config.validate(self)?;
+        }
+
+        #[cfg(all(feature = "fw_cfg", target_arch = "aarch64"))]
+        if let Some(fw_cfg_config) = &mut self.fw_cfg_config
+            && fw_cfg_config.e820
+        {
+            warn!("Ignoring fw_cfg e820 on ARM64");
+            fw_cfg_config.e820 = false;
         }
 
         Ok(())
@@ -1280,7 +1302,7 @@ pub struct VmConfig {
     // causes the FDs to be closed early. This allows management software to
     // gracefully clean up resources (e.g., libvirt closes tap devices).
     #[serde(skip)]
-    pub preserved_fds: Option<HashSet<i32>>,
+    pub preserved_fds: Option<HashSet<RawFd>>,
     #[serde(default)]
     pub landlock_enable: bool,
     pub landlock_rules: Option<Box<[LandlockConfig]>>,
@@ -1295,6 +1317,11 @@ impl VmConfig {
         #[cfg(target_arch = "aarch64")]
         {
             landlock.add_rule_with_access(Path::new("/sys/devices/system/cpu/cpu0/cache"), "r")?;
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        if let CpuProfileConfig::File(path) = &self.cpus.profile {
+            landlock.add_rule_with_access(path, "r")?;
         }
 
         if let Some(mem_zones) = &self.memory.zones {

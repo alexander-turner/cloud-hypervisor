@@ -30,10 +30,10 @@ Experimental features are under active development and no guarantees are made ab
 
 List of experimental features:
 
-- TDX
 - vfio-user
 - vDPA
 - Emulated ARM SMMUv3
+- [CPU profiles](cpu.md#profile)
 
 ### Security
 

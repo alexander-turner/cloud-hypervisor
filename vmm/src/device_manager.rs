@@ -21,6 +21,7 @@ use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io::{self, IsTerminal, Seek, SeekFrom, stdout};
 use std::num::Wrapping;
+use std::os::fd::BorrowedFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 #[cfg(not(target_arch = "riscv64"))]
@@ -33,8 +34,6 @@ use std::{iter, path, result, sync};
 
 use acpi_tables::sdt::GenericAddress;
 use acpi_tables::{Aml, aml};
-#[cfg(not(target_arch = "riscv64"))]
-use anyhow::anyhow;
 #[cfg(target_arch = "x86_64")]
 use arch::layout::{APIC_START, IOAPIC_SIZE, IOAPIC_START};
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
@@ -70,8 +69,6 @@ use devices::ivshmem::{IVSHMEM_DATA_BAR_IDX, IvshmemError, IvshmemOps};
 use devices::legacy::Pl011;
 #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
 use devices::legacy::Serial;
-#[cfg(all(feature = "fw_cfg", target_arch = "x86_64"))]
-use devices::legacy::fw_cfg::FW_CFG_ACPI_ID;
 #[cfg(feature = "fw_cfg")]
 use devices::legacy::{
     FwCfg,
@@ -87,7 +84,7 @@ use devices::{AcpiNotificationFlags, acpi, interrupt_controller, legacy, pvpanic
 use event_monitor::event;
 use hypervisor::IoEventAddress;
 #[cfg(target_arch = "aarch64")]
-use hypervisor::arch::aarch64::regs::AARCH64_PMU_IRQ;
+use hypervisor::arch::aarch64::regs::{AARCH64_GIC_MAINT_IRQ, AARCH64_PMU_IRQ};
 #[cfg(feature = "kvm")]
 use iommufd_ioctls::IommuFd;
 #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
@@ -122,13 +119,14 @@ use virtio_devices::{
     AccessPlatformMapping, Block, Endpoint, IommuMapping, VdpaDmaMapping, VirtioMemMappingSource,
     balloon, mem, net, transport, vdpa, vhost_user, vsock,
 };
+use vm_allocator::page_size::get_page_size;
 use vm_allocator::{AddressAllocator, InterruptAllocError, SystemAllocator};
 use vm_device::dma_mapping::ExternalDmaMapping;
 use vm_device::interrupt::{
     InterruptIndex, InterruptManager, InterruptRemapping, LegacyIrqGroupConfig, MsiIrqGroupConfig,
 };
 use vm_device::{Bus, BusDevice, BusDeviceSync, Resource, UserspaceMapping};
-#[cfg(feature = "ivshmem")]
+#[cfg(any(feature = "ivshmem", not(target_arch = "riscv64")))]
 use vm_memory::bitmap::AtomicBitmap;
 use vm_memory::guest_memory::FileOffset;
 use vm_memory::{
@@ -181,6 +179,8 @@ const GPIO_DEVICE_NAME: &str = "__gpio";
 const SMMUV3_DEVICE_NAME: &str = "__smmuv3";
 const RNG_DEVICE_NAME: &str = "__rng";
 const RTC_DEVICE_NAME: &str = "__rtc";
+#[cfg(not(target_arch = "riscv64"))]
+const VMGENID_DEVICE_NAME: &str = "__vmgenid";
 const IOMMU_DEVICE_NAME: &str = "__iommu";
 #[cfg(feature = "pvmemcontrol")]
 const PVMEMCONTROL_DEVICE_NAME: &str = "__pvmemcontrol";
@@ -276,8 +276,9 @@ pub enum DeviceManagerError {
     CreateVirtioVsock(#[source] io::Error),
 
     /// Cannot create tpm device
+    #[cfg(not(target_arch = "riscv64"))]
     #[error("Cannot create tmp device")]
-    CreateTpmDevice(#[source] anyhow::Error),
+    CreateTpmDevice(#[source] tpm::Error),
 
     /// Failed to convert Path to &str for the vDPA device.
     #[error("Failed to convert Path to &str for the vDPA device")]
@@ -325,11 +326,11 @@ pub enum DeviceManagerError {
 
     /// Cannot register ioevent.
     #[error("Cannot register ioevent")]
-    RegisterIoevent(#[source] anyhow::Error),
+    RegisterIoevent(#[source] hypervisor::HypervisorVmError),
 
     /// Cannot unregister ioevent.
     #[error("Cannot unregister ioevent")]
-    UnRegisterIoevent(#[source] anyhow::Error),
+    UnRegisterIoevent(#[source] hypervisor::HypervisorVmError),
 
     /// Cannot create virtio device
     #[error("Cannot create virtio device")]
@@ -409,7 +410,7 @@ pub enum DeviceManagerError {
 
     /// Failed to create the passthrough device.
     #[error("Failed to create the passthrough device")]
-    CreatePassthroughDevice(#[source] anyhow::Error),
+    CreatePassthroughDevice(#[source] hypervisor::HypervisorVmError),
 
     /// Cannot add legacy device to Bus.
     #[error("Cannot add legacy device to Bus")]
@@ -551,6 +552,16 @@ pub enum DeviceManagerError {
     #[error("Failed to do power button notification")]
     PowerButtonNotification(#[source] io::Error),
 
+    /// VM Generation ID device error
+    #[cfg(not(target_arch = "riscv64"))]
+    #[error("VM Generation ID device error")]
+    VmGenId(#[source] devices::VmGenIdError),
+
+    /// Failed to notify the VM Generation ID change
+    #[cfg(not(target_arch = "riscv64"))]
+    #[error("Failed to notify the VM Generation ID change")]
+    VmGenIdNotification(#[source] io::Error),
+
     /// Failed to do AArch64 GPIO power button notification
     #[cfg(target_arch = "aarch64")]
     #[error("Failed to do AArch64 GPIO power button notification")]
@@ -642,6 +653,10 @@ pub enum DeviceManagerError {
     #[error("Cannot create a RateLimiterGroup")]
     RateLimiterGroupCreate(#[source] group::Error),
 
+    /// The MMIO aperture is too small for all PCI segments
+    #[error("No MMIO aperture left for PCI segment {0}")]
+    PciSegmentMmioAperture(u16),
+
     // Invalid console info
     #[error("Invalid console info")]
     InvalidConsoleInfo,
@@ -727,30 +742,23 @@ impl DeviceRelocation for AddressManager {
                 } else {
                     &self.pci_mmio64_allocators
                 };
+                let mut pci_mmio_allocator = pci_mmio_allocators
+                    [usize::from(pci_dev.bdf().segment())]
+                .lock()
+                .unwrap();
 
-                // Find the specific allocator that this BAR was allocated from and use it for a new one
-                for pci_mmio_allocator_mutex in pci_mmio_allocators {
-                    let mut pci_mmio_allocator = pci_mmio_allocator_mutex.lock().unwrap();
-
-                    if old_base >= pci_mmio_allocator.base().0
-                        && old_base <= pci_mmio_allocator.end().0
-                    {
-                        if pci_mmio_allocator
-                            .move_range(
-                                GuestAddress(old_base),
-                                GuestAddress(new_base),
-                                len as GuestUsize,
-                                Some(len),
-                            )
-                            .is_none()
-                        {
-                            return Err(io::Error::other(format!(
-                                "Cannot move MMIO BAR address range from {old_base:#x} to {new_base:#x}"
-                            )));
-                        }
-
-                        break;
-                    }
+                if pci_mmio_allocator
+                    .move_range(
+                        GuestAddress(old_base),
+                        GuestAddress(new_base),
+                        len as GuestUsize,
+                        Some(len),
+                    )
+                    .is_none()
+                {
+                    return Err(io::Error::other(format!(
+                        "Cannot move MMIO BAR address range from {old_base:#x} to {new_base:#x}"
+                    )));
                 }
 
                 // Update MMIO bus
@@ -971,6 +979,14 @@ pub struct DeviceManager {
     #[cfg(target_arch = "aarch64")]
     acpi_tad_device: Option<Arc<Mutex<acpi_tad::AcpiTadDevice>>>,
 
+    // VM Generation ID device
+    #[cfg(not(target_arch = "riscv64"))]
+    vmgenid_device: Option<Arc<Mutex<devices::VmGenIdDevice>>>,
+
+    // VM Generation ID memory slot, removed in Drop
+    #[cfg(not(target_arch = "riscv64"))]
+    vmgenid_mapping: Option<UserspaceMapping>,
+
     // VM configuration
     config: Arc<Mutex<VmConfig>>,
 
@@ -1085,7 +1101,7 @@ pub struct DeviceManager {
     // pvpanic device
     pvpanic_device: Option<Arc<Mutex<devices::PvPanicDevice>>>,
 
-    // Force VIRTIO_F_ACCESS_PLATFORM on all virtio devices (e.g. for TDX/SEV-SNP)
+    // Force VIRTIO_F_ACCESS_PLATFORM on all virtio devices (e.g. for SEV-SNP)
     force_access_platform: bool,
     // List of unique identifiers provided at boot through the configuration.
     boot_id_list: BTreeSet<String>,
@@ -1140,7 +1156,7 @@ fn create_mmio_allocators(
     num_pci_segments: u16,
     weights: &[u32],
     alignment: u64,
-) -> Box<[Arc<Mutex<AddressAllocator>>]> {
+) -> DeviceManagerResult<Box<[Arc<Mutex<AddressAllocator>>]>> {
     let total_weight: u32 = weights.iter().sum();
 
     // Start each PCI segment mmio range on an aligned boundary
@@ -1160,14 +1176,15 @@ fn create_mmio_allocators(
         } else {
             pci_segment_mmio_size * weight
         };
-        let allocator = Arc::new(Mutex::new(
-            AddressAllocator::new(GuestAddress(mmio_start), mmio_size).unwrap(),
-        ));
+        let allocator = AddressAllocator::new(GuestAddress(mmio_start), mmio_size).ok_or(
+            DeviceManagerError::PciSegmentMmioAperture(segment_id as u16),
+        )?;
+        let allocator = Arc::new(Mutex::new(allocator));
         mmio_allocators.push(allocator);
         i += weight;
     }
 
-    mmio_allocators.into_boxed_slice()
+    Ok(mmio_allocators.into_boxed_slice())
 }
 
 fn use_64bit_bar_for_virtio_device(
@@ -1236,7 +1253,7 @@ impl DeviceManager {
             num_pci_segments,
             &mmio32_aperture_weights,
             4 << 10,
-        );
+        )?;
 
         let mut mmio64_aperture_weights: Vec<u32> =
             iter::repeat_n(DEFAULT_PCI_SEGMENT_APERTURE_WEIGHT, num_pci_segments.into()).collect();
@@ -1255,7 +1272,7 @@ impl DeviceManager {
             num_pci_segments,
             &mmio64_aperture_weights,
             4 << 30,
-        );
+        )?;
 
         // Keep BARs off reserved ranges.
         for (base, end) in memory_manager.lock().unwrap().reserved_regions() {
@@ -1382,6 +1399,10 @@ impl DeviceManager {
             ged_notification_device: None,
             #[cfg(target_arch = "aarch64")]
             acpi_tad_device: None,
+            #[cfg(not(target_arch = "riscv64"))]
+            vmgenid_device: None,
+            #[cfg(not(target_arch = "riscv64"))]
+            vmgenid_mapping: None,
             config,
             memory_manager,
             cpu_manager,
@@ -1632,14 +1653,18 @@ impl DeviceManager {
     #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
     fn vits_doorbell(&self) -> u64 {
         let vcpus = self.config.lock().unwrap().cpus.boot_vcpus;
-        gic::Gic::create_default_config(vcpus.into()).msi_addr + 0x1_0040
+        gic::Gic::create_default_config(vcpus.into())
+            .expect("the GIC was created with this vCPU count")
+            .msi_addr
+            + 0x1_0040
     }
 
     fn get_msi_iova_space(&mut self) -> (u64, u64) {
         #[cfg(target_arch = "aarch64")]
         {
             let vcpus = self.config.lock().unwrap().cpus.boot_vcpus;
-            let vgic_config = gic::Gic::create_default_config(vcpus.into());
+            let vgic_config = gic::Gic::create_default_config(vcpus.into())
+                .expect("the GIC was created with this vCPU count");
             (
                 vgic_config.msi_addr,
                 vgic_config.msi_addr + vgic_config.msi_size - 1,
@@ -1665,7 +1690,6 @@ impl DeviceManager {
         &self.id_to_dev_info
     }
 
-    #[allow(unused_variables)]
     fn add_pci_devices(&mut self, snapshot: Option<&Snapshot>) -> DeviceManagerResult<()> {
         let iommu_id = String::from(IOMMU_DEVICE_NAME);
 
@@ -1801,12 +1825,19 @@ impl DeviceManager {
         &mut self,
         snapshot: Option<&Snapshot>,
     ) -> DeviceManagerResult<Arc<Mutex<dyn InterruptController>>> {
+        let maintenance_irq = self
+            .cpu_manager
+            .lock()
+            .unwrap()
+            .nested()
+            .then_some(AARCH64_GIC_MAINT_IRQ);
         let interrupt_controller: Arc<Mutex<gic::Gic>> = Arc::new(Mutex::new(
             gic::Gic::new(
                 self.config.lock().unwrap().cpus.boot_vcpus,
                 Arc::clone(&self.msi_interrupt_manager)
                     as Arc<dyn InterruptManager<GroupConfig = MsiIrqGroupConfig>>,
                 Arc::clone(&self.address_manager.vm),
+                maintenance_irq,
             )
             .map_err(DeviceManagerError::CreateInterruptController)?,
         ));
@@ -1934,6 +1965,89 @@ impl DeviceManager {
         Ok(interrupt_controller)
     }
 
+    #[cfg(not(target_arch = "riscv64"))]
+    fn add_vmgenid_device(&mut self) -> DeviceManagerResult<()> {
+        let id = String::from(VMGENID_DEVICE_NAME);
+        let mut node = device_node!(id);
+
+        // KVM requires the memory slot to be page sized, so size it to the host
+        // page, which is 4 KiB or 64 KiB depending on the architecture.
+        let region_size = get_page_size();
+
+        let restored = self
+            .device_tree
+            .lock()
+            .unwrap()
+            .get(&id)
+            .and_then(|node| {
+                node.resources.iter().find_map(|resource| match resource {
+                    Resource::MmioAddressRange { base, .. } => Some(*base),
+                    _ => None,
+                })
+            })
+            .map(GuestAddress);
+
+        let address = self
+            .address_manager
+            .allocator
+            .lock()
+            .unwrap()
+            .allocate_platform_mmio_addresses(restored, region_size, Some(region_size))
+            .ok_or(DeviceManagerError::AllocateMmioAddress)?;
+
+        let region: Arc<MmapRegion<AtomicBitmap>> = Arc::new(
+            MemoryManager::create_ram_region_raw(
+                &None,
+                0,
+                region_size as usize,
+                false,
+                false,
+                false,
+                None,
+                None,
+                None,
+                false,
+            )
+            .map_err(DeviceManagerError::MemoryManager)?,
+        );
+
+        // SAFETY: the region outlives the mapping, which Drop removes.
+        let mem_slot = unsafe {
+            self.memory_manager
+                .lock()
+                .unwrap()
+                .create_userspace_mapping(
+                    address.0,
+                    region.len(),
+                    region.as_ptr(),
+                    false,
+                    false,
+                    false,
+                    hypervisor::MemoryVisibility::Shared,
+                )
+                .map_err(DeviceManagerError::MemoryManager)?
+        };
+        self.vmgenid_mapping = Some(UserspaceMapping {
+            mem_slot,
+            addr: address,
+            mapping: Arc::clone(&region),
+            mergeable: false,
+        });
+
+        let device = Arc::new(Mutex::new(
+            devices::VmGenIdDevice::new(address, region).map_err(DeviceManagerError::VmGenId)?,
+        ));
+
+        node.resources.push(Resource::MmioAddressRange {
+            base: address.0,
+            size: region_size,
+        });
+        self.device_tree.lock().unwrap().insert(id, node);
+        self.vmgenid_device = Some(device);
+
+        Ok(())
+    }
+
     fn add_acpi_devices(
         &mut self,
         interrupt_manager: &dyn InterruptManager<GroupConfig = LegacyIrqGroupConfig>,
@@ -1994,6 +2108,10 @@ impl DeviceManager {
             .unwrap()
             .allocate_platform_mmio_addresses(None, acpi::GED_DEVICE_ACPI_SIZE as u64, None)
             .ok_or(DeviceManagerError::AllocateMmioAddress)?;
+
+        #[cfg(not(target_arch = "riscv64"))]
+        self.add_vmgenid_device()?;
+
         let ged_device = Arc::new(Mutex::new(devices::AcpiGedDevice::new(
             interrupt_group,
             ged_irq,
@@ -2498,6 +2616,7 @@ impl DeviceManager {
                 self.console.socket = Some(listener);
                 Endpoint::Socket(Arc::new(inner))
             }
+            ConsoleTransport::TcpListen(listener) => Endpoint::TcpListen(listener),
             ConsoleTransport::Null => Endpoint::Null,
             ConsoleTransport::Off => return Ok(None),
         };
@@ -2575,7 +2694,8 @@ impl DeviceManager {
             ConsoleTransport::Off
             | ConsoleTransport::Null
             | ConsoleTransport::Pty(_)
-            | ConsoleTransport::Socket(_) => None,
+            | ConsoleTransport::Socket(_)
+            | ConsoleTransport::TcpListen(_) => None,
         };
 
         if !matches!(console_info.serial, ConsoleTransport::Off) {
@@ -2583,7 +2703,8 @@ impl DeviceManager {
             self.serial_manager = match console_info.serial {
                 ConsoleTransport::Pty(_)
                 | ConsoleTransport::Tty(_)
-                | ConsoleTransport::Socket(_) => {
+                | ConsoleTransport::Socket(_)
+                | ConsoleTransport::TcpListen(_) => {
                     let serial_manager = SerialManager::new(serial, console_info.serial)
                         .map_err(DeviceManagerError::CreateSerialManager)?;
                     if let Some(mut serial_manager) = serial_manager {
@@ -2611,7 +2732,8 @@ impl DeviceManager {
                 ConsoleTransport::Off
                 | ConsoleTransport::Null
                 | ConsoleTransport::Pty(_)
-                | ConsoleTransport::Socket(_) => None,
+                | ConsoleTransport::Socket(_)
+                | ConsoleTransport::TcpListen(_) => None,
             };
             if let Some(writer) = debug_console_writer {
                 let _ = self.add_debug_console_device(writer)?;
@@ -2627,9 +2749,7 @@ impl DeviceManager {
     #[cfg(not(target_arch = "riscv64"))]
     fn add_tpm_device(&mut self, tpm_path: &Path) -> DeviceManagerResult<Arc<Mutex<tpm::Tpm>>> {
         // Create TPM Device
-        let tpm = tpm::Tpm::new(tpm_path).map_err(|e| {
-            DeviceManagerError::CreateTpmDevice(anyhow!("Failed to create TPM Device : {e:?}"))
-        })?;
+        let tpm = tpm::Tpm::new(tpm_path).map_err(DeviceManagerError::CreateTpmDevice)?;
         let tpm = Arc::new(Mutex::new(tpm));
 
         // Add TPM Device to mmio
@@ -2790,7 +2910,8 @@ impl DeviceManager {
 
             if let Some(guest_block_size) = disk_cfg.guest_block_size
                 && disk_cfg.direct
-                && !disk_cfg.readonly
+                && (!disk_cfg.readonly
+                    || matches!(disk_cfg.image_type, ImageType::Raw | ImageType::FixedVhd))
                 && u64::from(guest_block_size) < disk.topology().logical_block_size
             {
                 return Err(DeviceManagerError::GuestBlockSizeBelowBackend);
@@ -2855,7 +2976,7 @@ impl DeviceManager {
                 self.force_access_platform | disk_cfg.pci_common.iommu.attached(),
                 disk_cfg.num_queues,
                 disk_cfg.queue_size,
-                disk_cfg.serial.clone(),
+                disk_cfg.serial.as_deref(),
                 self.seccomp_action.clone(),
                 rate_limit_group,
                 self.exit_evt
@@ -3007,9 +3128,17 @@ impl DeviceManager {
                     .map_err(DeviceManagerError::CreateVirtioNet)?,
                 ))
             } else if let Some(fds) = &net_cfg.fds {
+                let borrowed = fds
+                    .iter()
+                    .map(|fd| {
+                        // SAFETY: CLI and SCM_RIGHTS descriptors remain open while
+                        // constructing the device. Config validation rejects stale FDs.
+                        unsafe { BorrowedFd::borrow_raw(*fd) }
+                    })
+                    .collect::<Vec<_>>();
                 let net = virtio_devices::Net::from_tap_fds(
                     id.clone(),
-                    fds,
+                    &borrowed,
                     guest_mac,
                     net_cfg.mtu,
                     self.force_access_platform | net_cfg.pci_common.iommu.attached(),
@@ -3400,7 +3529,7 @@ impl DeviceManager {
                 .map_err(DeviceManagerError::PmemFileSetLen)?
         };
 
-        if size % 0x20_0000 != 0 {
+        if !size.is_multiple_of(0x20_0000) {
             return Err(DeviceManagerError::PmemSizeNotAligned);
         }
 
@@ -3817,7 +3946,7 @@ impl DeviceManager {
                 id.clone(),
                 device_path,
                 self.memory_manager.lock().unwrap().guest_memory(),
-                vdpa_cfg.num_queues as u16,
+                vdpa_cfg.num_queues,
                 state_from_id(snapshot, id.as_str())
                     .map_err(DeviceManagerError::RestoreGetState)?,
             )
@@ -3891,7 +4020,7 @@ impl DeviceManager {
                 self.address_manager
                     .vm
                     .create_passthrough_device()
-                    .map_err(|e| DeviceManagerError::CreatePassthroughDevice(e.into()))?,
+                    .map_err(DeviceManagerError::CreatePassthroughDevice)?,
             );
         }
 
@@ -3928,20 +4057,22 @@ impl DeviceManager {
                     .and_then(|p| p.iommufd_fd);
                 let iommufd = match iommufd_fd {
                     Some(fd) => {
-                        info!("Using vfio cdev mode with externally-supplied iommufd fd: {fd}.");
-                        // Dup so the IommuFd owns its own File; the
-                        // caller-supplied fd is kept alive across reboot
-                        // via VmConfig::preserved_fds.
-                        // SAFETY: FFI call to dup. Trivially safe.
-                        let dup_fd = unsafe { libc::dup(fd) };
-                        if dup_fd < 0 {
-                            return Err(DeviceManagerError::VfioDupFd(io::Error::last_os_error()));
-                        }
-                        // SAFETY: dup_fd is valid and can be owned by this File
-                        let file = unsafe { File::from_raw_fd(dup_fd) };
-                        // SAFETY: fd is a valid open iommufd
+                        // SAFETY: The CLI or SCM_RIGHTS supplied this live descriptor.
+                        let fd = unsafe { BorrowedFd::borrow_raw(fd) };
+                        info!(
+                            "Using vfio cdev mode with externally-supplied iommufd fd: {}.",
+                            fd.as_raw_fd()
+                        );
+                        let file = fd
+                            .try_clone_to_owned()
+                            .map(File::from)
+                            .map_err(DeviceManagerError::VfioDupFd)?;
+                        // SAFETY: IommuFd receives the duplicate; preserve the original for reboot.
                         unsafe {
-                            self.config.lock().unwrap().add_preserved_fds(vec![fd]);
+                            self.config
+                                .lock()
+                                .unwrap()
+                                .add_preserved_fds(vec![fd.as_raw_fd()]);
                         }
                         IommuFd::new_from_fd(file)
                     }
@@ -3975,11 +4106,12 @@ impl DeviceManager {
     #[cfg(feature = "kvm")]
     fn create_vfio_device_from_fd(
         &self,
-        fd: i32,
+        fd: BorrowedFd<'_>,
+        already_bound: bool,
         vfio_ops: &Arc<dyn VfioOps>,
         attach_ioas: bool,
     ) -> DeviceManagerResult<(VfioDevice, PathBuf)> {
-        let already_bound = {
+        {
             let config = self.config.lock().unwrap();
             assert!(
                 config.platform.as_ref().is_some_and(|p| p.iommufd),
@@ -3992,21 +4124,12 @@ impl DeviceManager {
                     .is_some_and(|p| p.iommufd_fd.is_some()),
                 "DeviceConfig::validate enforces iommufd_fd when device fd is set",
             );
-            // If a cdev fd was preserved on a prior boot, it is already bound
-            // to an iommufd instance
-            config
-                .preserved_fds
-                .as_ref()
-                .is_some_and(|s| s.contains(&fd))
-        };
-
-        // SAFETY: FFI call to dup. Trivially safe.
-        let dup_fd = unsafe { libc::dup(fd) };
-        if dup_fd < 0 {
-            return Err(DeviceManagerError::VfioDupFd(io::Error::last_os_error()));
         }
-        // SAFETY: dup_fd is a freshly-opened fd owned by this File.
-        let file = unsafe { File::from_raw_fd(dup_fd) };
+
+        let file = fd
+            .try_clone_to_owned()
+            .map(File::from)
+            .map_err(DeviceManagerError::VfioDupFd)?;
         let vfio_iommufd = (Arc::clone(vfio_ops) as Arc<dyn Any + Send + Sync>)
             .downcast::<VfioIommufd>()
             .map_err(|_| DeviceManagerError::ExpectedIommufdBackend)?;
@@ -4021,16 +4144,9 @@ impl DeviceManager {
                 .map_err(DeviceManagerError::VfioCreate)?
         };
 
-        // SAFETY: fd is a valid open vfio cdev FD; the VfioDevice only
-        // holds a dup, so VmConfig can safely take ownership of the
-        // original.
-        unsafe {
-            self.config.lock().unwrap().add_preserved_fds(vec![fd]);
-        }
-
         // Diagnostic-only: resolve the FD back to the path it was opened
         // from, falling back to /proc/self/fd/<n>.
-        let fd_link = PathBuf::from(format!("/proc/self/fd/{fd}"));
+        let fd_link = PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()));
         let device_path = fs::read_link(&fd_link).unwrap_or(fd_link);
         Ok((vfio_device, device_path))
     }
@@ -4046,13 +4162,8 @@ impl DeviceManager {
             .downcast::<VfioIommufd>()
             .map_err(|_| DeviceManagerError::ExpectedIommufdBackend)?;
         let viommu = Arc::new(
-            IommufdVIommu::new(
-                Arc::clone(vfio_iommufd.iommufd()),
-                vfio_iommufd.ioas_id(),
-                dev_id,
-                false,
-            )
-            .map_err(DeviceManagerError::IommufdCreate)?,
+            IommufdVIommu::new(Arc::clone(vfio_iommufd.ioas()), dev_id, false)
+                .map_err(DeviceManagerError::IommufdCreate)?,
         );
 
         let interrupt_manager = self
@@ -4224,13 +4335,9 @@ impl DeviceManager {
             None => self.add_smmuv3(&key, vfio_ops, dev_id)?,
         };
         let viommu = Arc::clone(smmuv3.backend());
+        let endpoint = Arc::clone(device) as Arc<dyn AttachHwpt>;
         viommu
-            .register_endpoint(
-                virt_id,
-                bdf,
-                Arc::clone(device) as Arc<dyn AttachHwpt>,
-                dev_id,
-            )
+            .register_endpoint(virt_id, bdf, &endpoint, dev_id)
             .map_err(DeviceManagerError::Smmuv3)?;
         let pasid_cap = viommu
             .pasid_cap(dev_id)
@@ -4334,11 +4441,18 @@ impl DeviceManager {
             (None, Some(fd)) => {
                 #[cfg(feature = "kvm")]
                 {
-                    self.create_vfio_device_from_fd(
-                        fd,
+                    let device = self.create_vfio_device_from_fd(
+                        // SAFETY: The CLI or SCM_RIGHTS supplied this live descriptor.
+                        unsafe { BorrowedFd::borrow_raw(fd) },
+                        device_cfg.iommufd_dev_id.is_some(),
                         &(Arc::clone(&vfio_ops) as Arc<dyn VfioOps>),
                         !smmuv3_attached,
-                    )?
+                    )?;
+                    // SAFETY: The device owns a duplicate; preserve the original for reboot.
+                    unsafe {
+                        self.config.lock().unwrap().add_preserved_fds(vec![fd]);
+                    }
+                    device
                 }
                 #[cfg(not(feature = "kvm"))]
                 {
@@ -4931,7 +5045,7 @@ impl DeviceManager {
             self.address_manager
                 .vm
                 .register_ioevent(event, &io_addr, None)
-                .map_err(|e| DeviceManagerError::RegisterIoevent(e.into()))?;
+                .map_err(DeviceManagerError::RegisterIoevent)?;
         }
 
         // Update the device tree with correct resource information.
@@ -5567,7 +5681,7 @@ impl DeviceManager {
                         self.address_manager
                             .vm
                             .unregister_ioevent(event, &io_addr)
-                            .map_err(|e| DeviceManagerError::UnRegisterIoevent(e.into()))?;
+                            .map_err(DeviceManagerError::UnRegisterIoevent)?;
                     }
                 }
 
@@ -5945,6 +6059,27 @@ impl DeviceManager {
             .map_err(DeviceManagerError::PowerButtonNotification)
     }
 
+    #[cfg(not(target_arch = "riscv64"))]
+    pub fn regenerate_vmgenid(&self) -> DeviceManagerResult<()> {
+        if let Some(device) = self.vmgenid_device.as_ref() {
+            device
+                .lock()
+                .unwrap()
+                .regenerate()
+                .map_err(DeviceManagerError::VmGenId)?;
+
+            self.ged_notification_device
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .notify(AcpiNotificationFlags::VMGENID_CHANGED)
+                .map_err(DeviceManagerError::VmGenIdNotification)?;
+        }
+
+        Ok(())
+    }
+
     #[cfg(target_arch = "aarch64")]
     pub fn notify_power_button(&self) -> DeviceManagerResult<()> {
         // There are two use cases:
@@ -6296,25 +6431,9 @@ impl Aml for DeviceManager {
         )
         .to_aml_bytes(sink);
 
-        #[cfg(all(feature = "fw_cfg", target_arch = "x86_64"))]
-        if self.fw_cfg.is_some() {
-            aml::Device::new(
-                "_SB_.FWCF".into(),
-                vec![
-                    &aml::Name::new("_HID".into(), &FW_CFG_ACPI_ID.to_string()),
-                    &aml::Name::new("_STA".into(), &0xB_usize),
-                    &aml::Name::new(
-                        "_CRS".into(),
-                        &aml::ResourceTemplate::new(vec![&aml::IO::new(
-                            FW_CFG_ADDRESS_BASE as u16,
-                            FW_CFG_ADDRESS_BASE as u16,
-                            0x01,
-                            FW_CFG_ADDRESS_WIDTH as u8,
-                        )]),
-                    ),
-                ],
-            )
-            .to_aml_bytes(sink);
+        #[cfg(feature = "fw_cfg")]
+        if let Some(fw_cfg) = &self.fw_cfg {
+            fw_cfg.lock().unwrap().to_aml_bytes(sink);
         }
 
         // Serial device
@@ -6389,6 +6508,11 @@ impl Aml for DeviceManager {
         if self.config.lock().unwrap().tpm.is_some() {
             // Add tpm device
             TpmDevice {}.to_aml_bytes(sink);
+        }
+
+        #[cfg(not(target_arch = "riscv64"))]
+        if let Some(vmgenid_device) = self.vmgenid_device.as_ref() {
+            vmgenid_device.lock().unwrap().to_aml_bytes(sink);
         }
 
         self.ged_notification_device
@@ -6655,10 +6779,25 @@ impl Drop for DeviceManager {
         // See eject_device() for the device hot-unplug equivalent.
         self.mmio_regions.lock().unwrap().clear();
 
-        // Wake up the DeviceManager threads (mainly virtio device workers),
-        // to avoid deadlock on waiting for paused/parked worker threads.
-        if let Err(e) = self.resume() {
-            error!("Error resuming DeviceManager: {e:?}");
+        // Remove the VM Generation ID memory slot created in add_vmgenid_device.
+        #[cfg(not(target_arch = "riscv64"))]
+        if let Some(mapping) = self.vmgenid_mapping.take() {
+            // SAFETY: the mapping was installed in add_vmgenid_device and its
+            // region is still alive.
+            if let Err(e) = unsafe {
+                self.memory_manager
+                    .lock()
+                    .unwrap()
+                    .remove_userspace_mapping(
+                        mapping.addr.0,
+                        mapping.mapping.len(),
+                        mapping.mapping.as_ptr(),
+                        mapping.mergeable,
+                        mapping.mem_slot,
+                    )
+            } {
+                error!("Failed to remove VM Generation ID mapping: {e}");
+            }
         }
 
         for handle in self.virtio_devices.drain(..) {
@@ -6754,7 +6893,7 @@ mod tests {
 
     #[test]
     fn test_create_mmio_allocators() {
-        let res = create_mmio_allocators(0x100000, 0x3fffff, 1, &[1], 4 << 10);
+        let res = create_mmio_allocators(0x100000, 0x3fffff, 1, &[1], 4 << 10).unwrap();
         assert_eq!(res.len(), 1);
         assert_eq!(
             res[0].lock().unwrap().base(),
@@ -6765,7 +6904,7 @@ mod tests {
             vm_memory::GuestAddress(0x3fffff)
         );
 
-        let res = create_mmio_allocators(0x100000, 0x3fffff, 2, &[1, 1], 4 << 10);
+        let res = create_mmio_allocators(0x100000, 0x3fffff, 2, &[1, 1], 4 << 10).unwrap();
         assert_eq!(res.len(), 2);
         assert_eq!(
             res[0].lock().unwrap().base(),
@@ -6784,7 +6923,7 @@ mod tests {
             vm_memory::GuestAddress(0x3fffff)
         );
 
-        let res = create_mmio_allocators(0x100000, 0x3fffff, 2, &[2, 1], 4 << 10);
+        let res = create_mmio_allocators(0x100000, 0x3fffff, 2, &[2, 1], 4 << 10).unwrap();
         assert_eq!(res.len(), 2);
         assert_eq!(
             res[0].lock().unwrap().base(),
@@ -6802,5 +6941,11 @@ mod tests {
             res[1].lock().unwrap().end(),
             vm_memory::GuestAddress(0x3fffff)
         );
+
+        // The 3 MiB aperture rounds down to 0 for each of 1024 segments.
+        assert!(matches!(
+            create_mmio_allocators(0x100000, 0x3fffff, 1024, &[1; 1024], 4 << 10),
+            Err(DeviceManagerError::PciSegmentMmioAperture(0))
+        ));
     }
 }

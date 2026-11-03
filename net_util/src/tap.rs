@@ -232,7 +232,8 @@ impl Tap {
         Self::open_named("vmtap%d", num_queue_pairs, None)
     }
 
-    pub fn from_tap_fd(fd: RawFd, num_queue_pairs: usize) -> Result<Tap> {
+    pub fn from_file(tap_file: File, num_queue_pairs: usize) -> Result<Tap> {
+        let fd = tap_file.as_raw_fd();
         // Ensure that the file is opened non-blocking, this is particularly
         // needed when opened via the shell for macvtap.
         // SAFETY: FFI call
@@ -245,8 +246,6 @@ impl Tap {
             return Err(Error::ConfigureTap(IoError::last_os_error()));
         }
 
-        // SAFETY: fd is a tap fd
-        let tap_file = unsafe { File::from_raw_fd(fd) };
         let mut ifreq: libc::ifreq = ifreq {
             ifr_name: [0; IFNAMSIZ],
             ifr_ifru: __c_anonymous_ifr_ifru { ifru_flags: 0 },
@@ -527,8 +526,9 @@ impl Tap {
         str::from_utf8(self.if_name.as_bytes()).expect("Tap interface name should be valid UTF-8")
     }
 
-    #[cfg(fuzzing)]
+    #[cfg(any(fuzzing, test))]
     pub fn new_for_fuzzing(tap_file: File, if_name: &str) -> Self {
+        #[expect(clippy::panic, reason = "fuzzing and test helper")]
         if if_name.len() > IFNAMSIZ - 1 {
             panic!("provided name longer than `IFNAMSIZ` without NULL terminator")
         }
@@ -735,12 +735,31 @@ mod tests {
     }
 
     #[test]
+    fn test_from_file_error_closes_only_the_passed_file() {
+        use std::fs::File;
+        use std::io::{ErrorKind, Read};
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let file = File::from(OwnedFd::from(socket));
+        Tap::from_file(file.try_clone().unwrap(), 1).unwrap_err();
+        assert_eq!(
+            peer.read(&mut [0]).unwrap_err().kind(),
+            ErrorKind::WouldBlock
+        );
+        drop(file);
+        assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+    }
+
+    #[test]
     fn test_tap_from_fd() {
         let _tap_ip_guard = TAP_IP_LOCK.lock().unwrap();
 
         let orig_tap = Tap::new(1).unwrap();
-        let fd = orig_tap.as_raw_fd();
-        let _new_tap = Tap::from_tap_fd(fd, 1).unwrap();
+        let file = orig_tap.tap_file.try_clone().unwrap();
+        let _new_tap = Tap::from_file(file, 1).unwrap();
     }
 
     #[test]

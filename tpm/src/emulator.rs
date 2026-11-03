@@ -3,22 +3,24 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use std::os::unix::io::RawFd;
+use std::io::{self, Read, Write};
+use std::os::unix::io::AsRawFd;
+use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::{io, mem, ptr};
+use std::time::Duration;
 
 use anyhow::anyhow;
-use libc::{sockaddr_storage, socklen_t};
 use log::{debug, error};
 use thiserror::Error;
 
 use crate::socket::SocketDev;
 use crate::{
-    Commands, MemberType, Ptm, PtmCap, PtmEst, PtmInit, PtmResult, PtmSetBufferSize,
-    TPM_CRB_BUFFER_MAX, TPM_SUCCESS,
+    Commands, Ptm, PtmCap, PtmEst, PtmInit, PtmResult, PtmSetBufferSize, TPM_CRB_BUFFER_MAX,
+    TPM_SUCCESS,
 };
 
 const TPM_REQ_HDR_SIZE: usize = 10;
+const TPM_DATA_SOCKET_READ_TIMEOUT: Duration = Duration::from_millis(100);
 const TPM_RC_INITIALIZE: u32 = 0x100;
 const TPM2_STARTUP_CLEAR: [u8; 12] = [
     0x80, 0x01, // TPM_ST_NO_SESSIONS
@@ -43,7 +45,6 @@ const PTM_CAP_SET_DATAFD: u64 = 1 << 12;
 const PTM_CAP_SET_BUFFERSIZE: u64 = 1 << 13;
 
 ///Check if the input command is selftest
-///
 pub fn is_selftest(input: &[u8]) -> bool {
     if input.len() >= TPM_REQ_HDR_SIZE {
         let ordinal: &[u8; 4] = input[6..6 + 4]
@@ -60,7 +61,7 @@ pub enum Error {
     #[error("Could not initialize emulator's backend")]
     InitializeEmulator(#[source] anyhow::Error),
     #[error("Failed to create data fd to pass to swtpm")]
-    PrepareDataFd(#[source] anyhow::Error),
+    PrepareDataFd(#[source] io::Error),
     #[error("Failed to run Control Cmd")]
     RunControlCmd(#[source] anyhow::Error),
     #[error("Emulator doesn't implement min required capabilities")]
@@ -85,7 +86,7 @@ pub struct BackendCmd<'a> {
 pub struct Emulator {
     caps: PtmCap, /* capabilities of the TPM */
     control_socket: SocketDev,
-    data_fd: RawFd,
+    data_socket: Option<UnixStream>,
     established_bit_cached: bool,
     established_bit: bool,
 }
@@ -96,7 +97,6 @@ impl Emulator {
     /// # Arguments
     ///
     /// * `path` - A path to the Unix Domain Socket swtpm is listening on
-    ///
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         if !path.exists() {
@@ -113,7 +113,7 @@ impl Emulator {
         let mut emulator = Self {
             caps: 0,
             control_socket: socket,
-            data_fd: -1,
+            data_socket: None,
             established_bit_cached: false,
             established_bit: false,
         };
@@ -143,76 +143,28 @@ impl Emulator {
     fn prepare_data_fd(&mut self) -> Result<()> {
         let mut res: PtmResult = 0;
 
-        let mut fds = [-1, -1];
-        // SAFETY: FFI calls and return value of the unsafe call is checked
-        unsafe {
-            let ret = libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr());
-            if ret == -1 {
-                return Err(Error::PrepareDataFd(anyhow!(
-                    "Failed to prepare data fd for tpm emulator. Error Code {:?}",
-                    io::Error::last_os_error()
-                )));
-            }
-        }
-        self.control_socket.set_msgfd(fds[1]);
-        debug!("data fd to be configured in swtpm = {:?}", fds[1]);
-        if let Err(e) = self.run_control_cmd(Commands::CmdSetDatafd, &mut res, 0, size_of::<u32>())
-        {
-            // SAFETY: FFI calls and return values of the unsafe calls are checked
-            unsafe {
-                if libc::close(fds[0]) == -1 {
-                    error!(
-                        "Failed to close TPM data fd after CmdSetDatafd failure: {:?}",
-                        io::Error::last_os_error()
-                    );
-                }
-                if libc::close(fds[1]) == -1 {
-                    error!(
-                        "Failed to close TPM swtpm fd after CmdSetDatafd failure: {:?}",
-                        io::Error::last_os_error()
-                    );
-                }
-            }
-            return Err(e);
-        }
-        // SAFETY: FFI call and return value of the unsafe call is checked
-        unsafe {
-            if libc::close(fds[1]) == -1 {
-                error!(
-                    "Failed to close local TPM swtpm fd: {:?}",
-                    io::Error::last_os_error()
-                );
-            }
-        }
-        debug!("data fd in cloud-hypervisor = {:?}", fds[0]);
-        self.data_fd = fds[0];
+        let (data_socket, swtpm_socket) = UnixStream::pair().map_err(Error::PrepareDataFd)?;
+        self.control_socket.set_msgfd(swtpm_socket.as_raw_fd());
+        debug!(
+            "data fd to be configured in swtpm = {:?}",
+            swtpm_socket.as_raw_fd()
+        );
+        self.run_control_cmd(Commands::CmdSetDatafd, &mut res, 0, size_of::<u32>())?;
+        drop(swtpm_socket);
+        debug!(
+            "data fd in cloud-hypervisor = {:?}",
+            data_socket.as_raw_fd()
+        );
 
-        // SAFETY: FFI calls and return value of the unsafe call is checked
-        unsafe {
-            let tv = libc::timeval {
-                tv_sec: 0,
-                tv_usec: 100000, // Set recv timeout to 100ms
-            };
-            let ret = libc::setsockopt(
-                fds[0],
-                libc::SOL_SOCKET,
-                libc::SO_RCVTIMEO,
-                (&raw const tv).cast(),
-                size_of::<libc::timeval>() as u32,
-            );
-            if ret == -1 {
-                return Err(Error::PrepareDataFd(anyhow!(
-                    "Failed to set receive timeout on data fd socket. Error Code {:?}",
-                    io::Error::last_os_error()
-                )));
-            }
-        }
-        self.control_socket.set_datafd(fds[0]);
+        data_socket
+            .set_read_timeout(Some(TPM_DATA_SOCKET_READ_TIMEOUT))
+            .map_err(Error::PrepareDataFd)?;
+        self.control_socket.set_datafd(data_socket.as_raw_fd());
+        self.data_socket = Some(data_socket);
         Ok(())
     }
 
     /// Gather TPM Capabilities and cache them in Emulator
-    ///
     fn probe_caps(&mut self) -> Result<()> {
         let mut caps: u64 = 0;
         self.run_control_cmd(Commands::CmdGetCapability, &mut caps, 0, size_of::<u64>())?;
@@ -235,14 +187,12 @@ impl Emulator {
         (self.caps & caps) == caps
     }
 
-    ///
     /// # Arguments
     ///
     /// * `cmd` - Control Command to run
     /// * `msg` - Optional msg to be sent along with Control Command
     /// * `msg_len_in` - len of 'msg' in bytes, if passed
     /// * `msg_len_out` - length of expected output from Control Command in bytes
-    ///
     fn run_control_cmd(
         &mut self,
         cmd: Commands,
@@ -310,7 +260,6 @@ impl Emulator {
             // swtpm returns only the 4-byte result code on error. Propagate
             // the failure without attempting to read or parse a payload that
             // will never arrive.
-            msg.set_member_type(MemberType::Response);
             msg.set_result_code(result_code);
             return Err(Error::RunControlCmd(anyhow!(
                 "Control Cmd {cmd:02X?} returned error code : {result_code:#X}"
@@ -337,9 +286,6 @@ impl Emulator {
                         "Failed while converting response of Control Cmd: {cmd:02X?} to PTM. Error: {e:?}"
                     ))
                 })?;
-        } else {
-            // No response expected, only handle return code
-            msg.set_member_type(MemberType::Response);
         }
 
         if msg.get_result_code() != TPM_SUCCESS {
@@ -383,9 +329,6 @@ impl Emulator {
 
     /// Function to write to data socket and read the response from it
     pub fn deliver_request(&mut self, cmd: &mut BackendCmd) -> Result<()> {
-        // SAFETY: type "sockaddr_storage" is valid with an all-zero byte-pattern value
-        let mut addr: sockaddr_storage = unsafe { mem::zeroed() };
-        let mut len = size_of::<sockaddr_storage>() as socklen_t;
         let isselftest = is_selftest(&cmd.buffer[0..cmd.input_len]);
 
         debug!(
@@ -393,50 +336,23 @@ impl Emulator {
             cmd.buffer, cmd.input_len
         );
 
-        let mut data_vecs = [libc::iovec {
-            iov_base: cmd.buffer.as_mut_ptr().cast(),
-            iov_len: cmd.input_len,
-        }; 1];
+        let mut data_socket = self
+            .data_socket
+            .as_ref()
+            .ok_or_else(|| Error::SendReceive(anyhow!("TPM data socket has not been prepared")))?;
+        data_socket
+            .write_all(&cmd.buffer[..cmd.input_len])
+            .map_err(|e| {
+                Error::SendReceive(anyhow!(
+                    "Failed to send tpm command over Data FD. Error Code {e:?}"
+                ))
+            })?;
 
-        // SAFETY: all zero values from the unsafe method are updated before usage
-        let mut msghdr: libc::msghdr = unsafe { mem::zeroed() };
-        msghdr.msg_name = ptr::null_mut();
-        msghdr.msg_namelen = 0;
-        msghdr.msg_iov = data_vecs.as_mut_ptr().cast();
-        msghdr.msg_iovlen = data_vecs.len() as _;
-        msghdr.msg_control = ptr::null_mut();
-        msghdr.msg_controllen = 0;
-        msghdr.msg_flags = 0;
-        // SAFETY: FFI call and the return value of the unsafe method is checked
-        unsafe {
-            let ret = libc::sendmsg(self.data_fd, &msghdr, 0);
-            if ret == -1 {
-                return Err(Error::SendReceive(anyhow!(
-                    "Failed to send tpm command over Data FD. Error Code {:?}",
-                    io::Error::last_os_error()
-                )));
-            }
-        }
-
-        let output_len;
-        // SAFETY: FFI calls and return value from unsafe method is checked
-        unsafe {
-            let ret = libc::recvfrom(
-                self.data_fd,
-                cmd.buffer.as_mut_ptr().cast(),
-                cmd.buffer.len(),
-                0,
-                (&raw mut addr).cast(),
-                &raw mut len,
-            );
-            if ret == -1 {
-                return Err(Error::SendReceive(anyhow!(
-                    "Failed to receive response for tpm command over Data FD. Error Code {:?}",
-                    io::Error::last_os_error()
-                )));
-            }
-            output_len = ret as usize;
-        }
+        let output_len = data_socket.read(cmd.buffer).map_err(|e| {
+            Error::SendReceive(anyhow!(
+                "Failed to receive response for tpm command over Data FD. Error Code {e:?}"
+            ))
+        })?;
         debug!(
             "response = {:02X?} len = {:?} selftest = {:?}",
             cmd.buffer, output_len, isselftest
@@ -529,23 +445,6 @@ impl Emulator {
 
     pub fn get_buffer_size(&mut self) -> usize {
         self.set_buffer_size(0).unwrap_or(TPM_CRB_BUFFER_MAX)
-    }
-}
-
-impl Drop for Emulator {
-    fn drop(&mut self) {
-        if self.data_fd >= 0 {
-            // SAFETY: FFI call and return value of the unsafe call is checked
-            unsafe {
-                if libc::close(self.data_fd) == -1 {
-                    error!(
-                        "Failed to close TPM data fd: {:?}",
-                        io::Error::last_os_error()
-                    );
-                }
-            }
-            self.data_fd = -1;
-        }
     }
 }
 

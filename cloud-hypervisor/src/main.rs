@@ -14,7 +14,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::ptr::from_ref;
 use std::sync::mpsc::channel;
-use std::{any, cmp, env, io, num, process, str};
+use std::{any, cmp, env, io, num, process};
 
 use clap::{Arg, ArgAction, ArgGroup, ArgMatches, Command};
 use event_monitor::event;
@@ -31,8 +31,8 @@ use vmm::api::http::http_api_graceful_shutdown;
 use vmm::api::{self, ApiAction};
 use vmm::config::{self, RestoreConfig, VmParams};
 use vmm::landlock::{Landlock, LandlockError};
+use vmm::seccomp_filters::{Thread, get_seccomp_filter};
 use vmm::vm::Vm;
-use vmm::vm_config;
 #[cfg(feature = "fw_cfg")]
 use vmm::vm_config::FwCfgConfig;
 #[cfg(feature = "ivshmem")]
@@ -43,8 +43,9 @@ use vmm::vm_config::{
     RateLimiterGroupConfig, RngConfig, RtcConfig, SerialConfig, TpmConfig, UserDeviceConfig,
     VdpaConfig, VmConfig, VsockConfig,
 };
+use vmm::{GuestResetAction, GuestShutdownAction, vm_config};
 use vmm_sys_util::eventfd::EventFd;
-use vmm_sys_util::signal::block_signal;
+use vmm_sys_util::signal::{block_signal, register_signal_handler};
 
 use crate::logger::Logger;
 
@@ -119,8 +120,10 @@ impl SeccompSiginfo {
     }
 }
 
-fn handle_sigsys(info: &libc::siginfo_t) {
-    let info = SeccompSiginfo::from_siginfo(info);
+extern "C" fn handle_sigsys(_: libc::c_int, info: *mut libc::siginfo_t, _: *mut libc::c_void) {
+    // SAFETY: The handler is installed with SA_SIGINFO, so the kernel passes
+    // a valid siginfo_t.
+    let info = SeccompSiginfo::from_siginfo(unsafe { &*info });
     let mut buffer = [0; SeccompSiginfo::OUTPUT_LEN];
     let message = info.format_into(&mut buffer);
     // SAFETY: message points to initialized memory for message.len() bytes.
@@ -147,6 +150,10 @@ enum Error {
     CreateExitEventFd(#[source] io::Error),
     #[error("Failed to open hypervisor interface (is hypervisor interface available?)")]
     CreateHypervisor(#[source] hypervisor::HypervisorError),
+    #[error("Failed to create main thread seccomp filter")]
+    CreateSeccompFilter(#[source] seccompiler::Error),
+    #[error("Failed to apply main thread seccomp filter")]
+    ApplySeccompFilter(#[source] seccompiler::Error),
     #[error("Failed to start the VMM thread")]
     StartVmmThread(#[source] vmm::Error),
     #[error("Error parsing config")]
@@ -267,7 +274,9 @@ fn get_cli_options_sorted(
                     kvm_hyperv=on|off,max_phys_bits=<maximum_number_of_physical_bits>,\
                     affinity=<list_of_vcpus_with_their_associated_cpuset>,\
                     features=<list_of_features_to_enable>,\
-                    nested=on|off,core_scheduling=vm|vcpu|off",
+                    nested=on|off,core_scheduling=vm|vcpu|off,\
+                    profile=host|path:<file>,\
+                    x-cpuid-overrides=[[<leaf>,<subleaf>,<eax>,<ebx>,<ecx>,<edx>],...]",
             )
             .default_value(default_vcpus)
             .group("vm-config"),
@@ -342,18 +351,38 @@ fn get_cli_options_sorted(
             .num_args(1..)
             .action(ArgAction::Append)
             .group("vm-config"),
-        #[cfg(feature = "igvm")]
-        Arg::new("igvm")
-            .long("igvm")
-            .help("Path to IGVM file to load.")
+        Arg::new("guest-reset-action")
+            .long("guest-reset-action")
+            .help(
+                "Action when the guest resets: reset the VM, exit the VMM, \
+                 or shut down the VM and keep the VMM running",
+            )
             .num_args(1)
-            .group("vm-payload"),
+            .value_parser(["reset-vm", "exit-vmm", "shutdown-vm"])
+            .default_value("reset-vm")
+            .group("vmm-config"),
+        Arg::new("guest-shutdown-action")
+            .long("guest-shutdown-action")
+            .help(
+                "Action when the guest shuts down: exit the VMM, \
+                 or shut down the VM and keep the VMM running",
+            )
+            .num_args(1)
+            .value_parser(["exit-vmm", "shutdown-vm"])
+            .default_value("exit-vmm")
+            .group("vmm-config"),
         #[cfg(feature = "sev_snp")]
         Arg::new("host-data")
             .long("host-data")
             .help("Host specific data to SEV SNP guest")
             .num_args(1)
             .group("vm-config"),
+        #[cfg(feature = "igvm")]
+        Arg::new("igvm")
+            .long("igvm")
+            .help("Path to IGVM file to load.")
+            .num_args(1)
+            .group("vm-payload"),
         Arg::new("initramfs")
             .long("initramfs")
             .help("Path to initramfs image")
@@ -379,7 +408,7 @@ fn get_cli_options_sorted(
             .help("enable/disable Landlock.")
             .action(ArgAction::SetTrue)
             .default_value("false")
-            .group("vm-config"),
+            .group("vmm-config"),
         Arg::new("landlock-rules")
             .long("landlock-rules")
             .help(LandlockConfig::SYNTAX)
@@ -438,9 +467,13 @@ fn get_cli_options_sorted(
             .group("vm-config"),
         Arg::new("no-shutdown")
             .long("no-shutdown")
-            .help("Do not exit the VMM when the guest shuts down")
+            .help(
+                "Do not exit the VMM when the guest shuts down \
+                 (deprecated: use --guest-shutdown-action=shutdown-vm)",
+            )
             .num_args(0)
             .action(ArgAction::SetTrue)
+            .conflicts_with("guest-shutdown-action")
             .group("vmm-config"),
         Arg::new("numa")
             .long("numa")
@@ -603,6 +636,46 @@ fn parse_api_socket(cmd_arguments: &ArgMatches) -> Result<(Option<String>, Optio
     }
 }
 
+fn parse_shutdown_action(cmd_arguments: &ArgMatches) -> GuestShutdownAction {
+    if cmd_arguments.get_flag("no-shutdown") {
+        warn!("--no-shutdown is deprecated: use --guest-shutdown-action=shutdown-vm instead");
+        return GuestShutdownAction::ShutdownVm;
+    }
+
+    match cmd_arguments
+        .get_one::<String>("guest-shutdown-action")
+        .unwrap()
+        .as_str()
+    {
+        "exit-vmm" => GuestShutdownAction::ExitVmm,
+        "shutdown-vm" => GuestShutdownAction::ShutdownVm,
+        _ => unreachable!("Clap validates --guest-shutdown-action values"),
+    }
+}
+
+fn parse_reset_action(cmd_arguments: &ArgMatches) -> GuestResetAction {
+    match cmd_arguments
+        .get_one::<String>("guest-reset-action")
+        .unwrap()
+        .as_str()
+    {
+        "reset-vm" => GuestResetAction::ResetVm,
+        "exit-vmm" => GuestResetAction::ExitVmm,
+        "shutdown-vm" => GuestResetAction::ShutdownVm,
+        _ => unreachable!("Clap validates --guest-reset-action values"),
+    }
+}
+
+fn parse_seccomp_action(cmd_arguments: &ArgMatches) -> SeccompAction {
+    match cmd_arguments.get_one::<String>("seccomp").unwrap().as_str() {
+        "true" => SeccompAction::Trap,
+        "false" => SeccompAction::Allow,
+        "log" => SeccompAction::Log,
+        "errno" => SeccompAction::Errno(libc::EPERM as u32),
+        _ => unreachable!("Clap validates --seccomp values"),
+    }
+}
+
 fn start_vmm(
     cmd_arguments: &ArgMatches,
     api_socket_path: &Option<String>,
@@ -628,32 +701,20 @@ fn start_vmm(
         .map(|()| log::set_max_level(log_level))
         .map_err(Error::LoggerSetup)?;
 
+    let shutdown_action = parse_shutdown_action(cmd_arguments);
+    let reset_action = parse_reset_action(cmd_arguments);
+    let seccomp_action = parse_seccomp_action(cmd_arguments);
+
     let (api_request_sender, api_request_receiver) = channel();
     let api_evt = EventFd::new(EFD_NONBLOCK).map_err(Error::CreateApiEventFd)?;
 
     let api_request_sender_clone = api_request_sender.clone();
-    let seccomp_action = if let Some(seccomp_value) = cmd_arguments.get_one::<String>("seccomp") {
-        match seccomp_value as &str {
-            "true" => SeccompAction::Trap,
-            "false" => SeccompAction::Allow,
-            "log" => SeccompAction::Log,
-            "errno" => SeccompAction::Errno(libc::EPERM as u32),
-            val => {
-                // The user providing an invalid value will be rejected
-                panic!("Invalid parameter {val} for \"--seccomp\" flag");
-            }
-        }
-    } else {
-        SeccompAction::Trap
-    };
 
     if seccomp_action == SeccompAction::Trap {
-        // SAFETY: handle_sigsys only performs async signal safe operations.
-        unsafe {
-            signal_hook_registry::register_sigaction(SIGSYS, handle_sigsys)
-                .map_err(|e| error!("Error adding SIGSYS signal handler: {e}"))
-                .ok();
-        }
+        // handle_sigsys only performs async signal safe operations.
+        register_signal_handler(SIGSYS, handle_sigsys)
+            .map_err(|e| error!("Error adding SIGSYS signal handler: {e}"))
+            .ok();
     }
 
     // SAFETY: Trivially safe.
@@ -679,6 +740,8 @@ fn start_vmm(
     info!("{} starting", env!("BUILD_VERSION"));
 
     let hypervisor = hypervisor::new().map_err(Error::CreateHypervisor)?;
+    let main_seccomp_filter = get_seccomp_filter(&seccomp_action, Thread::Main, None)
+        .map_err(Error::CreateSeccompFilter)?;
 
     #[cfg(feature = "guest_debug")]
     let gdb_socket_path = if let Some(gdb_config) = cmd_arguments.get_one::<String>("gdb") {
@@ -701,7 +764,6 @@ fn start_vmm(
 
     let exit_evt = EventFd::new(EFD_NONBLOCK).map_err(Error::CreateExitEventFd)?;
     let landlock_enable = cmd_arguments.get_flag("landlock");
-    let no_shutdown = cmd_arguments.get_flag("no-shutdown");
 
     #[allow(unused_mut)]
     let mut event_monitor = cmd_arguments
@@ -797,10 +859,16 @@ fn start_vmm(
         exit_evt.try_clone().unwrap(),
         &seccomp_action,
         hypervisor,
-        no_shutdown,
+        shutdown_action,
+        reset_action,
         landlock_enable,
     )
     .map_err(Error::StartVmmThread)?;
+
+    // Spawn workers first so they do not inherit main's narrower filter.
+    if !main_seccomp_filter.is_empty() {
+        seccompiler::apply_filter(&main_seccomp_filter).map_err(Error::ApplySeccompFilter)?;
+    }
 
     // API endpoints (HTTP, D-Bus) are set up at this point (if API socket is
     // configured)
@@ -947,10 +1015,6 @@ fn expand_fdtable() -> Result<(), FdTableError> {
 }
 
 fn main() {
-    #[cfg(feature = "tdx")]
-    compile_error!("Feature 'tdx' is broken.");
-    #[cfg(all(feature = "tdx", feature = "sev_snp"))]
-    compile_error!("Feature 'tdx' and 'sev_snp' are mutually exclusive.");
     #[cfg(all(feature = "sev_snp", not(target_arch = "x86_64")))]
     compile_error!("Feature 'sev_snp' needs target 'x86_64'");
     #[cfg(all(feature = "fw_cfg", target_arch = "riscv64"))]
@@ -1027,7 +1091,126 @@ mod tests {
     };
 
     use crate::test_util::assert_args_sorted;
-    use crate::{SeccompSiginfo, create_app, get_cli_options_sorted, prepare_default_values};
+    use crate::{
+        GuestResetAction, GuestShutdownAction, SeccompSiginfo, create_app, get_cli_options_sorted,
+        parse_reset_action, parse_shutdown_action, prepare_default_values,
+    };
+
+    #[test]
+    fn test_reset_action() {
+        for (options, expected) in [
+            (vec![], GuestResetAction::ResetVm),
+            (
+                vec!["--guest-reset-action", "reset-vm"],
+                GuestResetAction::ResetVm,
+            ),
+            (
+                vec!["--guest-reset-action", "exit-vmm"],
+                GuestResetAction::ExitVmm,
+            ),
+            (
+                vec!["--guest-reset-action=shutdown-vm"],
+                GuestResetAction::ShutdownVm,
+            ),
+            (vec!["--no-shutdown"], GuestResetAction::ResetVm),
+            (
+                vec![
+                    "--guest-shutdown-action=shutdown-vm",
+                    "--guest-reset-action=exit-vmm",
+                ],
+                GuestResetAction::ExitVmm,
+            ),
+        ] {
+            let mut args = vec!["cloud-hypervisor", "--api-socket", "/tmp/api.sock"];
+            args.extend(options);
+            let (default_vcpus, default_memory, default_rng) = prepare_default_values();
+            let matches = create_app(default_vcpus, default_memory, default_rng)
+                .try_get_matches_from(&args)
+                .unwrap();
+            assert!(
+                matches!(
+                    (parse_reset_action(&matches), expected),
+                    (GuestResetAction::ResetVm, GuestResetAction::ResetVm)
+                        | (GuestResetAction::ExitVmm, GuestResetAction::ExitVmm)
+                        | (GuestResetAction::ShutdownVm, GuestResetAction::ShutdownVm)
+                ),
+                "args: {args:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_reset_action_invalid_arguments() {
+        use clap::error::ErrorKind;
+
+        for options in [
+            vec!["--guest-reset-action", "invalid"],
+            vec!["--guest-reset-action"],
+        ] {
+            let mut args = vec!["cloud-hypervisor", "--api-socket", "/tmp/api.sock"];
+            args.extend(options);
+            let (default_vcpus, default_memory, default_rng) = prepare_default_values();
+            let error = create_app(default_vcpus, default_memory, default_rng)
+                .try_get_matches_from(&args)
+                .unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::InvalidValue);
+        }
+    }
+
+    #[test]
+    fn test_shutdown_action() {
+        for (options, shutdown) in [
+            (vec![], false),
+            (vec!["--guest-shutdown-action", "exit-vmm"], false),
+            (vec!["--guest-shutdown-action", "shutdown-vm"], true),
+            (vec!["--guest-shutdown-action=shutdown-vm"], true),
+            (vec!["--no-shutdown"], true),
+        ] {
+            let mut args = vec!["cloud-hypervisor", "--api-socket", "/tmp/api.sock"];
+            args.extend(options);
+            let (default_vcpus, default_memory, default_rng) = prepare_default_values();
+            let matches = create_app(default_vcpus, default_memory, default_rng)
+                .try_get_matches_from(&args)
+                .unwrap();
+            assert_eq!(
+                matches!(
+                    parse_shutdown_action(&matches),
+                    GuestShutdownAction::ShutdownVm
+                ),
+                shutdown,
+                "args: {args:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_shutdown_action_invalid_arguments() {
+        use clap::error::ErrorKind;
+
+        for (options, expected_error) in [
+            (
+                vec!["--guest-shutdown-action", "reset-vm"],
+                ErrorKind::InvalidValue,
+            ),
+            (vec!["--guest-shutdown-action"], ErrorKind::InvalidValue),
+            (
+                vec!["--no-shutdown", "--guest-shutdown-action", "exit-vmm"],
+                ErrorKind::ArgumentConflict,
+            ),
+            (
+                vec!["--guest-shutdown-action", "shutdown-vm", "--no-shutdown"],
+                ErrorKind::ArgumentConflict,
+            ),
+        ] {
+            let mut args = vec!["cloud-hypervisor", "--api-socket", "/tmp/api.sock"];
+            args.extend(options);
+            let (default_vcpus, default_memory, default_rng) = prepare_default_values();
+            let error = create_app(default_vcpus, default_memory, default_rng)
+                .try_get_matches_from(&args)
+                .unwrap_err();
+            assert_eq!(error.kind(), expected_error, "args: {args:?}");
+        }
+    }
 
     #[test]
     fn test_seccomp_siginfo_output() {
@@ -1053,6 +1236,17 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    #[test]
+    fn test_landlock_without_payload() {
+        // A VMM that receives its VM config later through vm.create can
+        // still confine its own threads.
+        let (default_vcpus, default_memory, default_rng) = prepare_default_values();
+        let cmd_arguments = create_app(default_vcpus, default_memory, default_rng)
+            .try_get_matches_from(["cloud-hypervisor", "--api-socket", "/tmp/api", "--landlock"])
+            .unwrap();
+        assert!(cmd_arguments.get_flag("landlock"));
     }
 
     fn get_vm_config_from_vec(args: &[&str]) -> VmConfig {
@@ -1081,6 +1275,30 @@ mod tests {
         (cli_vm_config, openapi_vm_config)
     }
 
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_valid_vm_config_cpuid_overrides() {
+        let cli = vec![
+            "cloud-hypervisor",
+            "--kernel",
+            "/path/to/kernel",
+            "--cpus",
+            "boot=2,x-cpuid-overrides=[[0x80000002,0x0,0x0,0x0,0x0,0x0]]",
+        ];
+        let openapi = r#"{
+            "payload": {"kernel": "/path/to/kernel"},
+            "cpus": {
+                "boot_vcpus": 2,
+                "max_vcpus": 2,
+                "x-cpuid-overrides": [{
+                    "leaf": "0x80000002", "subleaf": "0x0",
+                    "eax": "0x0", "ebx": "0x0", "ecx": "0x0", "edx": "0x0"
+                }]
+            }
+        }"#;
+        compare_vm_config_cli_vs_json(&cli, openapi, true);
+    }
+
     #[test]
     fn test_valid_vm_config_default() {
         let cli = vec!["cloud-hypervisor", "--kernel", "/path/to/kernel"];
@@ -1102,6 +1320,8 @@ mod tests {
                 nested: false,
                 core_scheduling: CoreScheduling::Vm,
                 profile: Default::default(),
+                #[cfg(target_arch = "x86_64")]
+                cpuid_overrides: Vec::new(),
             },
             memory: MemoryConfig {
                 size: 536_870_912,
@@ -1145,6 +1365,7 @@ mod tests {
                     file: None,
                     mode: ConsoleOutputMode::Null,
                     socket: None,
+                    tcp: None,
                 },
             },
             console: ConsoleConfig {
@@ -1152,6 +1373,7 @@ mod tests {
                     file: None,
                     mode: ConsoleOutputMode::Tty,
                     socket: None,
+                    tcp: None,
                 },
                 pci_common: PciDeviceCommonConfig::default(),
             },
@@ -1165,6 +1387,7 @@ mod tests {
             #[cfg(feature = "pvmemcontrol")]
             pvmemcontrol: None,
             iommu: false,
+            preserved_fds: None,
             numa: None,
             watchdog: false,
             rtc: None,
@@ -1173,7 +1396,6 @@ mod tests {
             pci_segments: None,
             platform: None,
             tpm: None,
-            preserved_fds: None,
             landlock_enable: false,
             landlock_rules: None,
             #[cfg(feature = "ivshmem")]

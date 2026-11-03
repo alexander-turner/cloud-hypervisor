@@ -186,6 +186,13 @@ Current constraints for `memory_restore_mode=copyonwrite`:
   content in a page that returns from the balloon, so this is correct.
   (`pvmemcontrol` differs: it issues operations that are only valid on
   anonymous memory, which is why it is on the fallback list above.)
+- A snapshot of a VM restored this way copies the restore source with a
+  reflink and then writes only the pages that changed since the restore.
+  For this, the snapshot and the restore source must be on the same
+  filesystem, and the filesystem must support reflinks (for example XFS or
+  btrfs). Before Linux 5.18, they must also be on the same mount. The new
+  memory file is complete, so it restores like any other snapshot. If a
+  reflink is not possible, all guest memory is written.
 - A device that is hot-plugged after the restore and that pins guest memory
   (VFIO, vfio-user, vDPA) write-faults every guest page when its IOMMU mapping
   is created. Every page becomes a private copy: the VM stays correct, but the
@@ -214,6 +221,36 @@ VFIO migration v2 protocol (e.g. Mellanox NICs bound to the `mlx5_vfio_pci`
 driver).
 
 See [`vfio.md`](vfio.md) for details on requirements and behavior.
+
+## VM Generation ID
+
+A snapshot captures the state of the guest random number generator along with
+the rest of guest memory, so every VM restored from the same snapshot starts
+with an identical generator state and produces the same stream from
+`/dev/urandom` until something reseeds it.
+
+The VM Generation ID device closes that gap. It exposes a 128 bit value that
+changes on every restore, which the guest driver takes as its cue to reseed.
+The device is always present and needs no configuration.
+
+The guest kernel config needs `CONFIG_VMGENID=y`, which builds the `vmgenid`
+platform driver into the kernel. It calls `add_vmfork_randomness()` when the
+value moves, which mixes the new value into the kernel pool and forces an
+immediate reseed that changes `/dev/urandom` and `getrandom()`.
+
+The device is reached through ACPI. On x86 a direct boot finds the ACPI tables
+through a legacy memory scan, so nothing extra is needed. On aarch64
+cloud-hypervisor advertises EFI stub tables in the device tree, so a direct boot
+reaches the ACPI tables through them, and the guest prefers ACPI over the device
+tree once `acpi=on` is on the kernel command line.
+
+A program that seeded a generator of its own at startup carries that seed into
+every clone, so it keeps producing the same values even though `/dev/urandom`
+has moved on. Such a program has to draw fresh randomness itself after the
+restore.
+
+A live migration draws a new value as well, because the destination completes
+through the same restore path.
 
 ## Offload Snapshot and Restore
 
@@ -330,6 +367,16 @@ call is the same as for a regular restore:
     --socket /tmp/restore.sock \
     --input-dir /var/snapshots/vm1 \
     --resume --ondemand
+```
+
+By default CH also pulls every remaining page in the background until guest
+memory is fully populated. A daemon that keeps memory in remote storage may
+prefer to serve only the pages the guest touches. Disable the background
+prefault on the receiving side:
+
+```bash
+./ch-remote --api-socket /tmp/cloud-hypervisor.sock \
+    receive-migration receiver_url=unix:/tmp/restore.sock,background_fetch_pages=off &
 ```
 
 ### The daemon protocol

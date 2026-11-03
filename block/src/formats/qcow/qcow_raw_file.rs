@@ -9,7 +9,6 @@ use std::io::{self, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::os::unix::fs::FileExt;
 
-use byteorder::{BigEndian, WriteBytesExt};
 use vmm_sys_util::write_zeroes::WriteZeroesAt;
 
 use crate::aligned_file::AlignedFile;
@@ -37,7 +36,7 @@ impl BeUint for u8 {
     }
     #[inline(always)]
     fn write_be<W: Write>(w: &mut W, val: Self) -> io::Result<()> {
-        w.write_u8(val)
+        w.write_all(&val.to_be_bytes())
     }
 }
 
@@ -48,7 +47,7 @@ impl BeUint for u16 {
     }
     #[inline(always)]
     fn write_be<W: Write>(w: &mut W, val: Self) -> io::Result<()> {
-        w.write_u16::<BigEndian>(val)
+        w.write_all(&val.to_be_bytes())
     }
 }
 
@@ -59,7 +58,7 @@ impl BeUint for u32 {
     }
     #[inline(always)]
     fn write_be<W: Write>(w: &mut W, val: Self) -> io::Result<()> {
-        w.write_u32::<BigEndian>(val)
+        w.write_all(&val.to_be_bytes())
     }
 }
 
@@ -72,7 +71,7 @@ impl BeUint for u64 {
     }
     #[inline(always)]
     fn write_be<W: Write>(w: &mut W, val: Self) -> io::Result<()> {
-        w.write_u64::<BigEndian>(val)
+        w.write_all(&val.to_be_bytes())
     }
 }
 
@@ -285,8 +284,13 @@ impl QcowRawFile {
         let declared_end = offset.saturating_add(total_entries.saturating_mul(entry_size));
         let tail_end = declared_end.min(self.file.metadata()?.len());
         if tail_end > tail_start {
-            let is_blkdev = is_block_device(self.file.as_raw_fd());
-            punch_hole(&mut self.file, is_blkdev, tail_start, tail_end - tail_start)?;
+            let is_blkdev = is_block_device(self.file.file());
+            punch_hole(
+                self.file.file_mut(),
+                is_blkdev,
+                tail_start,
+                tail_end - tail_start,
+            )?;
         }
 
         Ok(())

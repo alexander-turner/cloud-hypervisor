@@ -317,10 +317,25 @@ pub(crate) fn create_dsdt_table(
 
 const FACP_DSDT_OFFSET: usize = 140;
 
+#[cfg(target_arch = "aarch64")]
+fn arm_boot_flags(nested: bool) -> u16 {
+    // ACPI specification section 5.2.9.4. ARM Architecture Boot Flags
+    const PSCI_COMPLIANT: u16 = 0b01;
+    const PSCI_USE_HVC: u16 = 0b10;
+
+    // PSCI compliant, using SMC for an EL2 guest and HVC otherwise.
+    if nested {
+        PSCI_COMPLIANT
+    } else {
+        PSCI_COMPLIANT | PSCI_USE_HVC
+    }
+}
+
 fn create_facp_table(
     dsdt_offset: GuestAddress,
     device_manager: &DeviceManager,
     legacy_acpi_pm1a: bool,
+    #[cfg(target_arch = "aarch64")] nested: bool,
 ) -> Sdt {
     trace_scoped!("create_facp_table");
 
@@ -359,8 +374,7 @@ fn create_facp_table(
 
     // aarch64 specific fields
     #[cfg(target_arch = "aarch64")]
-    // ARM_BOOT_ARCH: enable PSCI with HVC enable-method
-    facp.write(129, 3u16);
+    facp.write(129, arm_boot_flags(nested));
 
     // Architecture common fields
     // HW_REDUCED_ACPI, RESET_REG_SUP, TMR_VAL_EXT
@@ -599,7 +613,7 @@ fn create_spcr_table(base_address: u64, gsi: u32) -> Sdt {
     // Base Address in format ACPI Generic Address Structure
     spcr.write(40, GenericAddress::mmio_address::<u8>(base_address));
     // Interrupt Type: Bit[3] ARMH GIC interrupt
-    spcr.write(52, (1 << 3) as u8);
+    spcr.write(52, 1u8 << 3);
     // Global System Interrupt used by the UART
     spcr.write(54, gsi.to_le());
     // Baud Rate: 3 = 9600
@@ -607,7 +621,7 @@ fn create_spcr_table(base_address: u64, gsi: u32) -> Sdt {
     // Stop Bits: 1 Stop bit
     spcr.write(60, 1u8);
     // Flow Control: Bit[1] = RTS/CTS hardware flow control
-    spcr.write(61, (1 << 1) as u8);
+    spcr.write(61, 1u8 << 1);
     // PCI Device ID: Not a PCI device
     spcr.write(64, 0xffff_u16);
     // PCI Vendor ID: Not a PCI device
@@ -1156,7 +1170,15 @@ fn create_acpi_tables_internal(
     let legacy_acpi_pm1a = cpu_manager.nested() && cpu_manager.kvm_hyperv();
     #[cfg(not(target_arch = "x86_64"))]
     let legacy_acpi_pm1a = false;
-    let facp = create_facp_table(dsdt_addr, device_manager, legacy_acpi_pm1a);
+    #[cfg(target_arch = "aarch64")]
+    let nested = cpu_manager.nested();
+    let facp = create_facp_table(
+        dsdt_addr,
+        device_manager,
+        legacy_acpi_pm1a,
+        #[cfg(target_arch = "aarch64")]
+        nested,
+    );
     let facp_addr = next_table_address(dsdt_addr, dsdt.len() as u64)?;
     tables_bytes.extend_from_slice(facp.as_slice());
     xsdt_table_pointers.push(facp_addr.0);
@@ -1422,60 +1444,6 @@ pub(crate) fn create_acpi_tables(
     );
 
     Ok(rsdp_addr)
-}
-
-#[cfg(feature = "tdx")]
-pub(crate) fn create_acpi_tables_tdx(
-    device_manager: &DeviceManager,
-    cpu_manager: &CpuManager,
-    memory_manager: &MemoryManager,
-    numa_nodes: &NumaNodes,
-) -> Vec<Sdt> {
-    // DSDT
-    let mut tables = vec![create_dsdt_table(
-        device_manager,
-        cpu_manager,
-        memory_manager,
-    )];
-
-    // FACP aka FADT
-    let legacy_acpi_pm1a = cpu_manager.nested() && cpu_manager.kvm_hyperv();
-    tables.push(create_facp_table(
-        GuestAddress(0),
-        device_manager,
-        legacy_acpi_pm1a,
-    ));
-
-    // MADT
-    tables.push(cpu_manager.create_madt());
-
-    // MCFG
-    tables.push(create_mcfg_table(device_manager.pci_segments()));
-
-    // SRAT and SLIT
-    // Only created if the NUMA nodes list is not empty.
-    if !numa_nodes.is_empty() {
-        #[cfg(target_arch = "x86_64")]
-        let topology = cpu_manager.get_vcpu_topology();
-
-        // SRAT
-        tables.push(create_srat_table(
-            numa_nodes,
-            device_manager,
-            #[cfg(target_arch = "x86_64")]
-            topology,
-        ));
-
-        // SLIT
-        tables.push(create_slit_table(numa_nodes));
-    }
-
-    // VIOT
-    if let Some((iommu_bdf, devices_bdf)) = device_manager.iommu_attached_devices() {
-        tables.push(create_viot_table(iommu_bdf, devices_bdf));
-    }
-
-    tables
 }
 
 #[cfg(test)]

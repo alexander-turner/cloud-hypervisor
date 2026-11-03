@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Write, stdout};
+use std::net::TcpListener;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::panic::AssertUnwindSafe;
 #[cfg(feature = "guest_debug")]
@@ -62,7 +63,8 @@ use crate::memory_manager::{MemoryManager, MemoryRangePolicy};
 #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
 use crate::migration::get_vm_snapshot;
 use crate::migration::transport::{
-    self, ReceiveAdditionalConnections, ReceiveListener, SendAdditionalConnections, SocketStream,
+    self, CONNECTION_SETUP_TIMEOUT, ReceiveAdditionalConnections, ReceiveListener,
+    SendAdditionalConnections, SocketStream,
 };
 use crate::migration::worker::{
     MigrationSeccompFilters, MigrationWorker, MigrationWorkerHandle, MigrationWorkerResult,
@@ -72,8 +74,8 @@ use crate::seccomp_filters::{Thread, get_seccomp_filter};
 use crate::util::flatten_error_chain_to_string;
 use crate::vm::{Error as VmError, Vm, VmState};
 use crate::vm_config::{
-    DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, NetConfig, PmemConfig,
-    UserDeviceConfig, VdpaConfig, VmConfig, VsockConfig,
+    DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, HotplugMethod, NetConfig,
+    PmemConfig, UserDeviceConfig, VdpaConfig, VmConfig, VsockConfig,
 };
 
 mod acpi;
@@ -95,6 +97,7 @@ pub mod landlock;
 pub mod locked_unix_listener;
 pub mod memory_manager;
 pub mod migration;
+mod pagemap;
 mod pci_segment;
 mod prefault;
 pub mod seccomp_filters;
@@ -252,8 +255,6 @@ pub enum MemoryZoneUpdateError {
 impl From<&VmConfig> for hypervisor::HypervisorVmConfig {
     fn from(_value: &VmConfig) -> Self {
         hypervisor::HypervisorVmConfig {
-            #[cfg(feature = "tdx")]
-            tdx_enabled: _value.platform.as_ref().is_some_and(|p| p.tdx),
             #[cfg(feature = "sev_snp")]
             sev_snp_enabled: _value.is_sev_snp_enabled(),
             #[cfg(feature = "sev_snp")]
@@ -397,8 +398,6 @@ pub fn feature_list() -> Vec<String> {
         "mshv".to_string(),
         #[cfg(feature = "sev_snp")]
         "sev_snp".to_string(),
-        #[cfg(feature = "tdx")]
-        "tdx".to_string(),
         #[cfg(feature = "tracing")]
         "tracing".to_string(),
         #[cfg(feature = "ivshmem")]
@@ -479,7 +478,8 @@ pub fn start_vmm_thread(
     exit_event: EventFd,
     seccomp_action: &SeccompAction,
     hypervisor: Arc<dyn hypervisor::Hypervisor>,
-    no_shutdown: bool,
+    shutdown_action: GuestShutdownAction,
+    reset_action: GuestResetAction,
     landlock_enable: bool,
 ) -> Result<VmmThreadHandle> {
     #[cfg(feature = "guest_debug")]
@@ -519,7 +519,8 @@ pub fn start_vmm_thread(
                     vmm_seccomp_action,
                     hypervisor,
                     exit_event,
-                    no_shutdown,
+                    shutdown_action,
+                    reset_action,
                 )?;
 
                 vmm.setup_signal_handler(landlock_enable)?;
@@ -696,6 +697,28 @@ impl VmOwnership {
     }
 }
 
+/// Action to take when the guest requests shutdown.
+#[derive(Default, Clone, Copy)]
+pub enum GuestShutdownAction {
+    /// Shut down the VM and exit the VMM.
+    #[default]
+    ExitVmm,
+    /// Shut down the VM while keeping the VMM running.
+    ShutdownVm,
+}
+
+/// Action to take when the guest requests a reset.
+#[derive(Default, Clone, Copy)]
+pub enum GuestResetAction {
+    /// Reset the VM.
+    #[default]
+    ResetVm,
+    /// Shut down the VM and exit the VMM.
+    ExitVmm,
+    /// Shut down the VM while keeping the VMM running.
+    ShutdownVm,
+}
+
 pub struct Vmm {
     epoll: EpollContext,
     exit_evt: EventFd,
@@ -719,7 +742,10 @@ pub struct Vmm {
     console_info: Option<ConsoleInfo>,
     serial_socket_listener: Option<Arc<LockedUnixListener>>,
     console_socket_listener: Option<Arc<LockedUnixListener>>,
-    no_shutdown: bool,
+    serial_tcp_listener: Option<Arc<TcpListener>>,
+    console_tcp_listener: Option<Arc<TcpListener>>,
+    shutdown_action: GuestShutdownAction,
+    reset_action: GuestResetAction,
     check_migration_evt: EventFd,
 }
 
@@ -737,6 +763,8 @@ struct ReceiveMigrationConfiguredData {
     /// The memory transfer mode announced by the sender in the received
     /// [`VmMigrationConfig`].
     memory_mode: MigrationMode,
+    /// Enable the background thread for faulting all remaining pages.
+    background_fetch_pages: bool,
 }
 
 /// The receiver's state machine behind the migration protocol.
@@ -766,9 +794,6 @@ enum ReceiveMigrationState {
 
     /// The migration is successful.
     Completed,
-
-    #[deprecated = "Will be removed with Command::Abandon once v54 is released"]
-    Aborted,
 }
 
 impl ReceiveMigrationState {
@@ -780,17 +805,7 @@ impl ReceiveMigrationState {
             ReceiveMigrationState::Configured(_) => "Configured",
             ReceiveMigrationState::StateReceived { .. } => "StateReceived",
             ReceiveMigrationState::Completed => "Completed",
-            #[expect(deprecated)]
-            ReceiveMigrationState::Aborted => "Aborted",
         }
-    }
-
-    #[expect(deprecated)]
-    fn finished(&self) -> bool {
-        matches!(
-            self,
-            ReceiveMigrationState::Completed | ReceiveMigrationState::Aborted
-        )
     }
 }
 
@@ -895,7 +910,8 @@ impl Vmm {
         seccomp_action: SeccompAction,
         hypervisor: Arc<dyn hypervisor::Hypervisor>,
         exit_evt: EventFd,
-        no_shutdown: bool,
+        shutdown_action: GuestShutdownAction,
+        reset_action: GuestResetAction,
     ) -> Result<Self> {
         let mut epoll = EpollContext::new().map_err(Error::Epoll)?;
         let reset_evt = EventFd::new(EFD_NONBLOCK).map_err(Error::EventFdCreate)?;
@@ -955,7 +971,10 @@ impl Vmm {
             console_info: None,
             serial_socket_listener: None,
             console_socket_listener: None,
-            no_shutdown,
+            serial_tcp_listener: None,
+            console_tcp_listener: None,
+            shutdown_action,
+            reset_action,
             check_migration_evt,
         })
     }
@@ -1029,6 +1048,7 @@ impl Vmm {
                     shared_backing,
                     fault_rx,
                     memory_mode,
+                    background_fetch_pages: receive_data_migration.background_fetch_pages,
                 })
             };
 
@@ -1040,12 +1060,6 @@ impl Vmm {
             memory_files.push((slot, file));
             Ok(memory_files)
         };
-
-        #[expect(deprecated)] // last sent in v52
-        if req.command() == Command::Abandon {
-            info!("Abandon Command Received");
-            return Ok(Aborted);
-        }
 
         let state_name = state.variant_name();
         match state {
@@ -1122,8 +1136,7 @@ impl Vmm {
                 }
                 c => invalid_command(state_name, c),
             },
-            #[expect(deprecated)]
-            Completed | Aborted => {
+            Completed => {
                 unreachable!("Performed a step on the finished state machine")
             }
         }
@@ -1138,11 +1151,16 @@ impl Vmm {
         event!("vm", "migration-receive-ready");
         // Accept the connection and get the socket
         let mut socket = listener.accept()?;
+        // The sender sends its first request right after connecting. Without
+        // a timeout, a peer that stays silent blocks the receiver forever.
+        socket
+            .set_read_timeout(Some(CONNECTION_SETUP_TIMEOUT))
+            .map_err(MigratableError::MigrateSocket)?;
 
         event!("vm", "migration-receive-starting");
         let mut state = ReceiveMigrationState::Established;
 
-        while !state.finished() {
+        while !matches!(state, ReceiveMigrationState::Completed) {
             let req = Request::read_from(&mut socket).map_err(|e| {
                 let hint = match &e {
                     MigratableError::MigrateSocket(io_error)
@@ -1158,6 +1176,14 @@ impl Vmm {
                 )))
             })?;
             debug!("Command '{:?}' received", req.command());
+
+            if matches!(state, ReceiveMigrationState::Established) {
+                // Later requests can take long, e.g. while the memory goes over
+                // the additional connections.
+                socket
+                    .set_read_timeout(None)
+                    .map_err(MigratableError::MigrateSocket)?;
+            }
 
             state = self
                 .vm_receive_migration_step(
@@ -1190,10 +1216,6 @@ impl Vmm {
         }
 
         match state {
-            #[expect(deprecated)]
-            ReceiveMigrationState::Aborted => Err(MigratableError::MigrateReceive(anyhow!(
-                "Received Abandon command"
-            ))),
             ReceiveMigrationState::Completed => Ok(()),
             _ => unreachable!("loop only exits in Completed or Aborted"),
         }
@@ -1229,6 +1251,7 @@ impl Vmm {
                 .start_postcopy_serving(
                     &saved_regions,
                     shared_backing,
+                    config_data.background_fetch_pages,
                     fault_stream,
                     &self.exit_evt,
                 )
@@ -1361,13 +1384,14 @@ impl Vmm {
             config.lock().unwrap().cpus.max_phys_bits,
         );
 
+        let vm_config = config.lock().unwrap();
         let memory_manager = MemoryManager::new(
             vm,
-            &config.lock().unwrap().memory.clone(),
+            &vm_config.memory.clone(),
             None,
             phys_bits,
-            #[cfg(feature = "tdx")]
-            false,
+            #[cfg(feature = "sev_snp")]
+            vm_config.is_sev_snp_enabled(),
             Some(&vm_migration_config.memory_manager_data),
             existing_memory_files,
         )
@@ -1686,8 +1710,6 @@ impl Vmm {
     /// migrations.
     fn send_migration(
         vm: &mut Vm,
-        #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
-        hypervisor: &dyn hypervisor::Hypervisor,
         send_data_migration: &VmSendMigrationData,
         initial_vm_state: VmState,
         seccomp_filters: &MigrationSeccompFilters,
@@ -1700,7 +1722,7 @@ impl Vmm {
         let memory_mode = send_data_migration.effective_memory_mode();
 
         // Set up the socket connection
-        let mut socket = transport::send_migration_socket(
+        let mut socket = transport::connect_and_setup_socket(
             &send_data_migration.destination_url,
             send_data_migration.tls_dir.as_deref(),
         )?;
@@ -1720,40 +1742,7 @@ impl Vmm {
         // Send config
         let vm_config = vm.get_config();
         #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
-        let common_cpuid = {
-            #[cfg(feature = "tdx")]
-            if vm_config.lock().unwrap().is_tdx_enabled() {
-                return Err(MigratableError::MigrateSend(anyhow!(
-                    "Live Migration is not supported when TDX is enabled"
-                )));
-            }
-
-            let (amx, max_phys_bits, profile, kvm_hyperv) = {
-                let guard = vm_config.lock().unwrap();
-                (
-                    guard.cpus.features.amx,
-                    guard.cpus.max_phys_bits,
-                    guard.cpus.profile,
-                    guard.cpus.kvm_hyperv,
-                )
-            };
-
-            let phys_bits = vm::physical_bits(hypervisor, max_phys_bits);
-
-            arch::generate_common_cpuid(
-                hypervisor,
-                &arch::CpuidConfig {
-                    phys_bits,
-                    kvm_hyperv,
-                    #[cfg(feature = "tdx")]
-                    tdx: false,
-                    amx,
-                    profile,
-                },
-            )
-            .context("Error generating common cpuid")
-            .map_err(MigratableError::MigrateSend)?
-        };
+        let common_cpuid = { vm.cpu_manager().lock().unwrap().common_cpuid() };
 
         // Send memory FDs
         match (&mut socket, memory_mode) {
@@ -1908,6 +1897,12 @@ impl Vmm {
         } else {
             Request::complete_paused()
         };
+        // The destination may already run the VM once it got this request.
+        // Giving up would resume the source as well, so wait for the answer.
+        // This needs a more careful investigation, see #9208.
+        socket
+            .set_read_timeout(None)
+            .map_err(MigratableError::MigrateSocket)?;
         let (_, complete_duration) = measure_ok(|| {
             // We might lose an ACK, but this is preferable to an inconsistent
             // source VM or both VMs running. This is a known postcopy tradeoff.
@@ -2032,13 +2027,6 @@ impl Vmm {
         src_vm_config: &Arc<Mutex<VmConfig>>,
         src_vm_cpuid: &[x86::CpuIdEntry],
     ) -> result::Result<(), MigratableError> {
-        #[cfg(feature = "tdx")]
-        if src_vm_config.lock().unwrap().is_tdx_enabled() {
-            return Err(MigratableError::MigrateReceive(anyhow!(
-                "Live Migration is not supported when TDX is enabled"
-            )));
-        }
-
         // We check the `CPUID` compatibility of between the source vm and destination, which is
         // mostly about feature compatibility.
         let dest_cpuid = &{
@@ -2060,11 +2048,10 @@ impl Vmm {
                 &arch::CpuidConfig {
                     phys_bits,
                     kvm_hyperv: vm_config.cpus.kvm_hyperv,
-                    #[cfg(feature = "tdx")]
-                    tdx: false,
                     amx: vm_config.cpus.features.amx,
-                    profile: vm_config.cpus.profile,
+                    cpuid_overrides: vm_config.cpus.cpuid_overrides.clone(),
                 },
+                None,
             )
             .context("Error generating common cpuid")
             .map_err(MigratableError::MigrateReceive)?
@@ -2157,6 +2144,7 @@ impl Vmm {
 
     /// Handles the outcome of the migration worker thread.
     fn check_migration(&mut self) {
+        #[expect(clippy::panic, reason = "only called during a migration")]
         let VmOwnership::Migration {
             migration_worker_handle,
             ..
@@ -2305,17 +2293,31 @@ impl Vmm {
                         // Consume the event.
                         self.reset_evt.read().map_err(Error::EventFdRead)?;
                         // TODO: Future follow-up must resolve lifecycle handling while migrating.
-                        self.vm_reboot().map_err(Error::VmReboot)?;
+                        match self.reset_action {
+                            GuestResetAction::ResetVm => {
+                                self.vm_reboot().map_err(Error::VmReboot)?;
+                            }
+                            GuestResetAction::ExitVmm => {
+                                self.vmm_shutdown().map_err(Error::VmmShutdown)?;
+                                break 'outer;
+                            }
+                            GuestResetAction::ShutdownVm => {
+                                self.vm_shutdown().map_err(Error::VmShutdown)?;
+                            }
+                        }
                     }
                     EpollDispatch::GuestExit => {
                         info!("VM guest exit event");
                         self.guest_exit_evt.read().map_err(Error::EventFdRead)?;
                         // TODO: Future follow-up must resolve lifecycle handling while migrating.
-                        if self.no_shutdown {
-                            self.vm_shutdown().map_err(Error::VmShutdown)?;
-                        } else {
-                            self.vmm_shutdown().map_err(Error::VmmShutdown)?;
-                            break 'outer;
+                        match self.shutdown_action {
+                            GuestShutdownAction::ExitVmm => {
+                                self.vmm_shutdown().map_err(Error::VmmShutdown)?;
+                                break 'outer;
+                            }
+                            GuestShutdownAction::ShutdownVm => {
+                                self.vm_shutdown().map_err(Error::VmShutdown)?;
+                            }
                         }
                     }
                     EpollDispatch::ActivateVirtioDevices => {
@@ -2446,7 +2448,6 @@ fn apply_vfio_fds_to_vm_config(
         .iommufd_fd = Some(iommufd_fd);
 }
 
-#[allow(unused)]
 fn update_memory_zones(
     zone_updates: &[VmMemoryZoneUpdateData],
     vm_config: &Arc<Mutex<VmConfig>>,
@@ -2602,7 +2603,13 @@ impl RequestHandler for Vmm {
         match self.vm {
             VmOwnership::Owned(ref mut vm) => vm.pause().map_err(VmError::Pause),
             VmOwnership::Migration { .. } => Err(VmError::VmMigrating),
-            VmOwnership::None => Err(VmError::VmNotRunning),
+            VmOwnership::None => {
+                if self.vm_config.is_none() {
+                    Err(VmError::VmNotCreated)
+                } else {
+                    Err(VmError::VmNotRunning)
+                }
+            }
         }
     }
 
@@ -2610,7 +2617,13 @@ impl RequestHandler for Vmm {
         match self.vm {
             VmOwnership::Owned(ref mut vm) => vm.resume().map_err(VmError::Resume),
             VmOwnership::Migration { .. } => Err(VmError::VmMigrating),
-            VmOwnership::None => Err(VmError::VmNotRunning),
+            VmOwnership::None => {
+                if self.vm_config.is_none() {
+                    Err(VmError::VmNotCreated)
+                } else {
+                    Err(VmError::VmNotRunning)
+                }
+            }
         }
     }
 
@@ -2676,8 +2689,11 @@ impl RequestHandler for Vmm {
                 // Swap each VFIO device's saved path or stale FD for the cdev
                 // FD received with the restore request, and install the fresh
                 // iommufd FD backing them. The one saved in the snapshot is
-                // stale, and validate() has confirmed both accompany vfio_fds.
-                if let Some(restored_vfios) = restore_cfg.vfio_fds {
+                // stale, and validate() has confirmed both accompany a
+                // non-empty vfio_fds.
+                if let Some(restored_vfios) = restore_cfg.vfio_fds
+                    && !restored_vfios.is_empty()
+                {
                     let mut config = vm_config.lock().unwrap();
                     if let Some(vm_device_configs) = config.devices.as_mut() {
                         for v in restored_vfios.iter() {
@@ -2742,6 +2758,9 @@ impl RequestHandler for Vmm {
     }
 
     fn vm_shutdown(&mut self) -> result::Result<(), VmError> {
+        if self.vm_config.is_none() {
+            return Err(VmError::VmNotCreated);
+        }
         let mut vm = self.vm.take_owned_or(VmError::VmNotRunning)?;
         // Drain console_info so that the FDs are not reused
         let _ = self.console_info.take();
@@ -2786,13 +2805,6 @@ impl RequestHandler for Vmm {
             .activate_evt
             .try_clone()
             .map_err(VmError::EventFdClone)?;
-
-        // The Linux kernel fires off an i8042 reset after doing the ACPI reset so there may be
-        // an event sitting in the shared reset_evt. Without doing this we get very early reboots
-        // during the boot process.
-        if self.reset_evt.read().is_ok() {
-            warn!("Spurious second reset event received. Ignoring.");
-        }
 
         self.console_info =
             Some(pre_create_console_devices(self).map_err(VmError::CreateConsoleDevices)?);
@@ -2912,6 +2924,8 @@ impl RequestHandler for Vmm {
         self.console_info = None;
         self.serial_socket_listener = None;
         self.console_socket_listener = None;
+        self.serial_tcp_listener = None;
+        self.console_tcp_listener = None;
         self.vm_config = None;
         event!("vm", "deleted");
 
@@ -2931,6 +2945,30 @@ impl RequestHandler for Vmm {
         desired_balloon: Option<u64>,
     ) -> result::Result<(), VmError> {
         self.vm_config.as_ref().ok_or(VmError::VmNotCreated)?;
+
+        {
+            // Validate the configuration change in a cloned configuration
+            let mut config = self.vm_config.as_ref().unwrap().lock().unwrap().clone();
+            if let Some(desired_vcpus) = desired_vcpus {
+                config.cpus.boot_vcpus = desired_vcpus;
+            }
+            if let Some(desired_ram) = desired_ram {
+                // A running VM stores the hotplugged virtio-mem memory separately
+                if matches!(self.vm, VmOwnership::Owned(_))
+                    && config.memory.hotplug_method == HotplugMethod::VirtioMem
+                {
+                    config.memory.hotplugged_size = desired_ram.checked_sub(config.memory.size);
+                } else {
+                    config.memory.size = desired_ram;
+                }
+            }
+            if let Some(desired_balloon) = desired_balloon
+                && let Some(balloon_config) = &mut config.balloon
+            {
+                balloon_config.size = desired_balloon;
+            }
+            config.validate().map_err(VmError::ConfigValidation)?;
+        }
 
         match self.vm {
             VmOwnership::Owned(ref mut vm) => vm
@@ -2968,6 +3006,26 @@ impl RequestHandler for Vmm {
 
     fn vm_resize_zone(&mut self, id: String, desired_ram: u64) -> result::Result<(), VmError> {
         self.vm_config.as_ref().ok_or(VmError::VmNotCreated)?;
+
+        {
+            // Validate the configuration change in a cloned configuration
+            let mut config = self.vm_config.as_ref().unwrap().lock().unwrap().clone();
+            if let Some(zone) = config
+                .memory
+                .zones
+                .iter_mut()
+                .flatten()
+                .find(|zone| zone.id == id)
+            {
+                // A running VM stores the hotplugged zone memory separately
+                if matches!(self.vm, VmOwnership::Owned(_)) {
+                    zone.hotplugged_size = desired_ram.checked_sub(zone.size);
+                } else {
+                    zone.size = desired_ram;
+                }
+            }
+            config.validate().map_err(VmError::ConfigValidation)?;
+        }
 
         match self.vm {
             VmOwnership::Owned(ref mut vm) => {
@@ -3317,7 +3375,13 @@ impl RequestHandler for Vmm {
         match self.vm {
             VmOwnership::Owned(ref mut vm) => vm.power_button(),
             VmOwnership::Migration { .. } => Err(VmError::VmMigrating),
-            VmOwnership::None => Err(VmError::VmNotRunning),
+            VmOwnership::None => {
+                if self.vm_config.is_none() {
+                    Err(VmError::VmNotCreated)
+                } else {
+                    Err(VmError::VmNotRunning)
+                }
+            }
         }
     }
 
@@ -3358,6 +3422,14 @@ impl RequestHandler for Vmm {
             receive_data_migration.tls_dir.is_some(),
             receive_data_migration.zone_updates,
         );
+
+        if receive_data_migration.receiver_url.starts_with("tcp:")
+            && receive_data_migration.tls_dir.is_none()
+        {
+            warn!(
+                "Receiving migration over unencrypted, unauthenticated TCP. Consider TLS (tls_dir=<path>)."
+            );
+        }
 
         let listener = transport::receive_migration_listener(
             &receive_data_migration.receiver_url,
@@ -3433,6 +3505,14 @@ impl RequestHandler for Vmm {
             send_data_migration.timeout().as_secs(),
             send_data_migration.timeout_strategy
         );
+
+        if send_data_migration.destination_url.starts_with("tcp:")
+            && send_data_migration.tls_dir.is_none()
+        {
+            warn!(
+                "Sending migration over unencrypted, unauthenticated TCP. Consider TLS (tls_dir=<path>)."
+            );
+        }
 
         {
             let vm_config = self.vm_config.as_ref().unwrap().lock().unwrap();
@@ -3521,8 +3601,6 @@ impl RequestHandler for Vmm {
             vm,
             check_migration_evt,
             send_data_migration,
-            #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
-            Arc::clone(&self.hypervisor),
             initial_vm_state,
             seccomp_filters,
         ) {
@@ -3599,15 +3677,16 @@ mod util {
 mod tests {
     use std::path::PathBuf;
 
-    use arch::CpuProfile;
+    use arch::CpuProfileConfig;
 
     use super::*;
-    use crate::config::RestoredVfioConfig;
+    use crate::config::{RestoredVfioConfig, ValidationError};
+    use crate::console_devices::ConsoleDeviceError;
     #[cfg(target_arch = "x86_64")]
     use crate::vm_config::DebugConsoleConfig;
     use crate::vm_config::{
-        CommonConsoleConfig, ConsoleConfig, ConsoleOutputMode, CoreScheduling, CpuFeatures,
-        CpusConfig, DeviceConfig, HotplugMethod, MemoryConfig, MemoryZoneConfig, PayloadConfig,
+        BalloonConfig, CommonConsoleConfig, ConsoleConfig, ConsoleOutputMode, CoreScheduling,
+        CpuFeatures, CpusConfig, DeviceConfig, MemoryConfig, MemoryZoneConfig, PayloadConfig,
         PciDeviceCommonConfig, PlatformConfig, RngConfig, SerialConfig,
     };
 
@@ -3622,7 +3701,8 @@ mod tests {
             SeccompAction::Allow,
             hypervisor::new().unwrap(),
             EventFd::new(EFD_NONBLOCK).unwrap(),
-            false,
+            GuestShutdownAction::default(),
+            GuestResetAction::default(),
         )
         .unwrap()
     }
@@ -3639,7 +3719,9 @@ mod tests {
                 features: CpuFeatures::default(),
                 nested: true,
                 core_scheduling: CoreScheduling::default(),
-                profile: CpuProfile::default(),
+                profile: CpuProfileConfig::default(),
+                #[cfg(target_arch = "x86_64")]
+                cpuid_overrides: Vec::new(),
             },
             memory: MemoryConfig {
                 size: 536_870_912,
@@ -3683,6 +3765,7 @@ mod tests {
                     file: None,
                     mode: ConsoleOutputMode::Null,
                     socket: None,
+                    tcp: None,
                 },
             },
             console: ConsoleConfig {
@@ -3691,6 +3774,7 @@ mod tests {
                     // Caution: Don't use `Tty` to not mess with users terminal
                     mode: ConsoleOutputMode::Off,
                     socket: None,
+                    tcp: None,
                 },
                 pci_common: PciDeviceCommonConfig::default(),
             },
@@ -3720,6 +3804,10 @@ mod tests {
         })
     }
 
+    pub(crate) fn test_fd() -> File {
+        File::open("/dev/null").unwrap()
+    }
+
     #[test]
     fn test_vmm_vm_create() {
         let mut vmm = create_dummy_vmm();
@@ -3730,6 +3818,38 @@ mod tests {
             vmm.vm_create(config),
             Err(VmError::VmAlreadyCreated)
         ));
+    }
+
+    // vm.create sets up the console devices before the config is validated.
+    #[test]
+    fn test_vmm_vm_create_serial_file_without_path() {
+        let mut vmm = create_dummy_vmm();
+        let mut config = create_dummy_vm_config();
+        config.serial.common.mode = ConsoleOutputMode::File;
+
+        assert!(matches!(
+            vmm.vm_create(config),
+            Err(VmError::CreateConsoleDevices(
+                ConsoleDeviceError::MissingFilePath
+            ))
+        ));
+    }
+
+    #[test]
+    fn test_vmm_lifecycle_errors_when_vm_is_not_created() {
+        let mut vmm = create_dummy_vmm();
+
+        assert!(matches!(vmm.vm_pause(), Err(VmError::VmNotCreated)));
+        assert!(matches!(vmm.vm_resume(), Err(VmError::VmNotCreated)));
+        assert!(matches!(vmm.vm_power_button(), Err(VmError::VmNotCreated)));
+        assert!(matches!(vmm.vm_shutdown(), Err(VmError::VmNotCreated)));
+
+        vmm.vm_create(create_dummy_vm_config()).unwrap();
+
+        assert!(matches!(vmm.vm_pause(), Err(VmError::VmNotRunning)));
+        assert!(matches!(vmm.vm_resume(), Err(VmError::VmNotRunning)));
+        assert!(matches!(vmm.vm_power_button(), Err(VmError::VmNotRunning)));
+        assert!(matches!(vmm.vm_shutdown(), Err(VmError::VmNotRunning)));
     }
 
     #[test]
@@ -3827,6 +3947,73 @@ mod tests {
                 .clone()
                 .unwrap()[0],
             user_device_config
+        );
+    }
+
+    #[test]
+    fn test_vmm_vm_cold_resize_validates_config() {
+        let mut vmm = create_dummy_vmm();
+        let mut config = create_dummy_vm_config();
+        config.cpus.boot_vcpus = 2;
+        config.cpus.max_vcpus = 4;
+        config.disks = Some(vec![
+            DiskConfig::parse("path=/path/to_file,image_type=raw,num_queues=2").unwrap(),
+        ]);
+        config.balloon = Some(BalloonConfig::parse("size=128M").unwrap());
+        let _ = vmm.vm_create(config);
+        let config = vmm.vm_config.clone().unwrap();
+
+        assert!(matches!(
+            vmm.vm_resize(Some(1), None, None),
+            Err(VmError::ConfigValidation(ValidationError::TooManyQueues(
+                2, 1
+            )))
+        ));
+        assert_eq!(config.lock().unwrap().cpus.boot_vcpus, 2);
+
+        assert!(matches!(
+            vmm.vm_resize(None, None, Some(512 << 20)),
+            Err(VmError::ConfigValidation(
+                ValidationError::BalloonLargerThanRam(_, _)
+            ))
+        ));
+        assert_eq!(
+            config.lock().unwrap().balloon.as_ref().unwrap().size,
+            128 << 20
+        );
+
+        vmm.vm_resize(Some(4), None, Some(256 << 20)).unwrap();
+        assert_eq!(config.lock().unwrap().cpus.boot_vcpus, 4);
+        assert_eq!(
+            config.lock().unwrap().balloon.as_ref().unwrap().size,
+            256 << 20
+        );
+    }
+
+    #[test]
+    fn test_vmm_vm_cold_resize_zone_validates_config() {
+        let mut vmm = create_dummy_vmm();
+        let mut config = create_dummy_vm_config();
+        config.memory = MemoryConfig::parse("size=0", Some(vec!["id=mem0,size=512M"])).unwrap();
+        config.balloon = Some(BalloonConfig::parse("size=256M").unwrap());
+        let _ = vmm.vm_create(config);
+        let config = vmm.vm_config.clone().unwrap();
+
+        assert!(matches!(
+            vmm.vm_resize_zone("mem0".to_string(), 256 << 20),
+            Err(VmError::ConfigValidation(
+                ValidationError::BalloonLargerThanRam(_, _)
+            ))
+        ));
+        assert_eq!(
+            config.lock().unwrap().memory.zones.as_ref().unwrap()[0].size,
+            512 << 20
+        );
+
+        vmm.vm_resize_zone("mem0".to_string(), 1 << 30).unwrap();
+        assert_eq!(
+            config.lock().unwrap().memory.zones.as_ref().unwrap()[0].size,
+            1 << 30
         );
     }
 
@@ -4172,18 +4359,19 @@ mod tests {
 
     fn receive_data(
         vfio_fds: Option<Vec<RestoredVfioConfig>>,
-        iommufd_fd: Option<i32>,
+        iommufd_fd: Option<RawFd>,
     ) -> VmReceiveMigrationData {
         VmReceiveMigrationData {
             receiver_url: "tcp:127.0.0.1:4321".to_string(),
-            tls_dir: None,
             vfio_fds,
             iommufd_fd,
             zone_updates: vec![],
+            background_fetch_pages: true,
+            ..Default::default()
         }
     }
 
-    fn vfio_fd(id: &str, fd: i32) -> RestoredVfioConfig {
+    fn vfio_fd(id: &str, fd: RawFd) -> RestoredVfioConfig {
         RestoredVfioConfig {
             id: id.to_owned(),
             fd: Some(fd),
@@ -4202,34 +4390,61 @@ mod tests {
 
     #[test]
     fn test_apply_vfio_fds_swaps_path_for_fd() {
+        let vfio = test_fd();
+        let iommu = test_fd();
+
         let vm_config = vm_config_with_vfio_devices(&["vfio0", "vfio1"], true);
-        let data = receive_data(Some(vec![vfio_fd("vfio1", 5)]), Some(6));
+        let data = receive_data(
+            Some(vec![vfio_fd("vfio1", vfio.as_raw_fd())]),
+            Some(iommu.as_raw_fd()),
+        );
         apply_vfio_fds_to_vm_config(&data, &vm_config);
         let config = vm_config.lock().unwrap();
         let devices = config.devices.as_ref().unwrap();
         assert!(devices[0].path.is_some());
         assert!(devices[0].fd.is_none());
         assert!(devices[1].path.is_none());
-        assert_eq!(devices[1].fd, Some(5));
-        assert_eq!(config.platform.as_ref().unwrap().iommufd_fd, Some(6));
+        assert_eq!(
+            devices[1].fd.as_ref().unwrap().as_raw_fd(),
+            vfio.as_raw_fd()
+        );
+        assert_eq!(
+            config
+                .platform
+                .as_ref()
+                .unwrap()
+                .iommufd_fd
+                .as_ref()
+                .unwrap()
+                .as_raw_fd(),
+            iommu.as_raw_fd()
+        );
     }
 
     #[test]
     fn test_validate_vfio_fds_requires_iommufd_fd() {
+        let vfio = test_fd();
+
         let vm_config = vm_config_with_vfio_devices(&["vfio0"], true);
-        let data = receive_data(Some(vec![vfio_fd("vfio0", 5)]), None);
+        let data = receive_data(Some(vec![vfio_fd("vfio0", vfio.as_raw_fd())]), None);
         data.validate_vfio_fds(&vm_config.lock().unwrap())
             .unwrap_err();
     }
 
     #[test]
     fn test_validate_vfio_fds_unknown_id_fails() {
+        let vfio = test_fd();
+        let iommu = test_fd();
+
         // vfio0 is covered so coverage passes, the extra bogus id is what the
         // id match must reject.
         let vm_config = vm_config_with_vfio_devices(&["vfio0"], true);
         let data = receive_data(
-            Some(vec![vfio_fd("vfio0", 5), vfio_fd("missing", 6)]),
-            Some(7),
+            Some(vec![
+                vfio_fd("vfio0", vfio.as_raw_fd()),
+                vfio_fd("missing", vfio.as_raw_fd()),
+            ]),
+            Some(iommu.as_raw_fd()),
         );
         data.validate_vfio_fds(&vm_config.lock().unwrap())
             .unwrap_err();
@@ -4237,10 +4452,16 @@ mod tests {
 
     #[test]
     fn test_validate_vfio_fds_duplicate_id_fails() {
+        let vfio = test_fd();
+        let iommu = test_fd();
+
         let vm_config = vm_config_with_vfio_devices(&["vfio0"], true);
         let data = receive_data(
-            Some(vec![vfio_fd("vfio0", 5), vfio_fd("vfio0", 6)]),
-            Some(7),
+            Some(vec![
+                vfio_fd("vfio0", vfio.as_raw_fd()),
+                vfio_fd("vfio0", vfio.as_raw_fd()),
+            ]),
+            Some(iommu.as_raw_fd()),
         );
         data.validate_vfio_fds(&vm_config.lock().unwrap())
             .unwrap_err();
@@ -4248,8 +4469,14 @@ mod tests {
 
     #[test]
     fn test_validate_vfio_fds_requires_iommufd_backend() {
+        let vfio = test_fd();
+        let iommu = test_fd();
+
         let vm_config = vm_config_with_vfio_devices(&["vfio0"], false);
-        let data = receive_data(Some(vec![vfio_fd("vfio0", 5)]), Some(6));
+        let data = receive_data(
+            Some(vec![vfio_fd("vfio0", vfio.as_raw_fd())]),
+            Some(iommu.as_raw_fd()),
+        );
         data.validate_vfio_fds(&vm_config.lock().unwrap())
             .unwrap_err();
     }
@@ -4261,7 +4488,7 @@ mod tests {
             let mut config = vm_config.lock().unwrap();
             let device = &mut config.devices.as_mut().unwrap()[0];
             device.path = None;
-            device.fd = Some(-1);
+            device.fd = None;
         }
         receive_data(None, None)
             .validate_vfio_fds(&vm_config.lock().unwrap())
@@ -4280,8 +4507,14 @@ mod tests {
 
     #[test]
     fn test_validate_vfio_fds_all_substituted_ok() {
+        let vfio = test_fd();
+        let iommu = test_fd();
+
         let vm_config = vm_config_with_vfio_devices(&["vfio0"], true);
-        let data = receive_data(Some(vec![vfio_fd("vfio0", 5)]), Some(6));
+        let data = receive_data(
+            Some(vec![vfio_fd("vfio0", vfio.as_raw_fd())]),
+            Some(iommu.as_raw_fd()),
+        );
         data.validate_vfio_fds(&vm_config.lock().unwrap()).unwrap();
     }
 

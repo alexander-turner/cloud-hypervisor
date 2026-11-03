@@ -54,7 +54,6 @@ pub struct GenericVhostUser {
     cache: Option<(VirtioSharedMemoryList, MmapRegion)>,
     seccomp_action: SeccompAction,
     exit_evt: EventFd,
-    access_platform_enabled: bool,
     cfg_warning: AtomicBool,
 }
 
@@ -73,17 +72,14 @@ impl GenericVhostUser {
         state: Option<State>,
     ) -> Result<GenericVhostUser> {
         // Calculate the actual number of queues needed.
-        let num_queues = request_queue_sizes.len();
+        let num_queues =
+            u16::try_from(request_queue_sizes.len()).map_err(|_| Error::BadQueueNum)?;
 
         // Connect to the vhost-user socket.
-        let mut vu = VhostUserHandle::connect_vhost_user(
-            false,
-            path,
-            num_queues as u64,
-            false,
-            &exit_evt,
-            |_| Ok(()),
-        )?;
+        let mut vu =
+            VhostUserHandle::connect_vhost_user(false, path, num_queues, false, &exit_evt, |_| {
+                Ok(())
+            })?;
 
         let (
             avail_features,
@@ -128,12 +124,12 @@ impl GenericVhostUser {
                 if acked_protocol_features & VhostUserProtocolFeatures::MQ.bits() != 0 {
                     vu.socket_handle()
                         .get_queue_num()
-                        .map_err(Error::VhostUserGetQueueMaxNum)? as usize
+                        .map_err(Error::VhostUserGetQueueMaxNum)?
                 } else {
-                    num_queues
+                    num_queues as u64
                 };
 
-            if num_queues > backend_num_queues {
+            if num_queues as u64 > backend_num_queues {
                 error!(
                     "generic vhost-user requested too many queues ({num_queues}) \
 since the backend only supports {backend_num_queues}\n",
@@ -141,8 +137,13 @@ since the backend only supports {backend_num_queues}\n",
                 return Err(Error::BadQueueNum);
             }
 
+            let mut avail_features = acked_features;
+            if access_platform_enabled {
+                avail_features |= 1u64 << VIRTIO_F_ACCESS_PLATFORM;
+            }
+
             (
-                acked_features,
+                avail_features,
                 // If part of the available features that have been acked, the
                 // PROTOCOL_FEATURES bit must be already set through the VIRTIO
                 // acked features as we know the guest would never ack it, thus
@@ -178,7 +179,6 @@ since the backend only supports {backend_num_queues}\n",
             cache,
             seccomp_action,
             exit_evt,
-            access_platform_enabled,
             cfg_warning: AtomicBool::new(false),
         })
     }
@@ -219,11 +219,7 @@ impl VirtioDevice for GenericVhostUser {
     }
 
     fn features(&self) -> u64 {
-        let mut features = self.vu_common.virtio_common.avail_features;
-        if self.access_platform_enabled {
-            features |= 1u64 << VIRTIO_F_ACCESS_PLATFORM;
-        }
-        features
+        self.vu_common.virtio_common.avail_features
     }
 
     fn ack_features(&mut self, value: u64) {
@@ -238,11 +234,15 @@ impl VirtioDevice for GenericVhostUser {
             data.fill(0xFF);
             return;
         }
-        if let Err(e) = self
-            .vu_common
-            .vu
-            .as_ref()
-            .unwrap()
+        let Some(vu) = &self.vu_common.vu else {
+            error!(
+                "Missing vhost-user handle for socket {}",
+                self.vu_common.socket_path
+            );
+            data.fill(0xFF);
+            return;
+        };
+        if let Err(e) = vu
             .lock()
             .unwrap()
             .socket_handle()
@@ -254,7 +254,8 @@ impl VirtioDevice for GenericVhostUser {
             )
             .map(|(_, config)| data.copy_from_slice(&config))
         {
-            panic!("Failed getting generic vhost-user configuration: {e}");
+            error!("Failed getting generic vhost-user configuration: {e}");
+            data.fill(0xFF);
         }
     }
 
@@ -264,21 +265,19 @@ impl VirtioDevice for GenericVhostUser {
             self.warn_no_config_access();
             return;
         }
-        if let Err(e) = self
-            .vu_common
-            .vu
-            .as_ref()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .socket_handle()
-            .set_config(
-                offset.try_into().unwrap(),
-                VhostUserConfigFlags::WRITABLE,
-                data,
-            )
-        {
-            panic!("Failed setting generic vhost-user configuration: {e}");
+        let Some(vu) = &self.vu_common.vu else {
+            error!(
+                "Missing vhost-user handle for socket {}",
+                self.vu_common.socket_path
+            );
+            return;
+        };
+        if let Err(e) = vu.lock().unwrap().socket_handle().set_config(
+            offset.try_into().unwrap(),
+            VhostUserConfigFlags::WRITABLE,
+            data,
+        ) {
+            error!("Failed setting generic vhost-user configuration: {e}");
         }
     }
 

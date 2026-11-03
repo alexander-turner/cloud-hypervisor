@@ -4,13 +4,13 @@
 
 use std::io;
 use std::num::Wrapping;
-use std::ops::{Deref, DerefMut};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use log::{debug, error, info};
 use rate_limiter::{RateLimiter, TokenType};
+use smallvec::SmallVec;
 use thiserror::Error;
 use virtio_bindings::virtio_net::{
     VIRTIO_NET_HDR_F_NEEDS_CSUM, VIRTIO_NET_HDR_GSO_NONE, virtio_net_hdr_v1,
@@ -22,11 +22,45 @@ use vm_virtio::{AccessPlatform, Translatable};
 
 use super::{Tap, register_listener, unregister_listener, vnet_hdr_len};
 
+/// Linux sets MAX_SKB_FRAGS + 2 descriptors per RX chain when guest offloads
+/// are on and mergeable RX buffers are off, as with this device [0, 1, 2], and
+/// at most MAX_SKB_FRAGS + 2 per TX chain [3].
+///
+/// [0]: https://elixir.bootlin.com/linux/v7.2/source/include/linux/skbuff.h#L354
+/// [1]: https://elixir.bootlin.com/linux/v7.2/source/drivers/net/virtio_net.c#L6695
+/// [2]: https://elixir.bootlin.com/linux/v7.2/source/drivers/net/virtio_net.c#L2647
+/// [3]: https://elixir.bootlin.com/linux/v7.2/source/drivers/net/virtio_net.c#L3316
+const CHAIN_INLINE_DESCS: usize = 19;
+
+type Iovecs = SmallVec<[libc::iovec; CHAIN_INLINE_DESCS]>;
+
+/// Resolves guest ranges to host iovecs for readv()/writev(). The pointers
+/// stay valid as long as `mem` is mapped.
+fn guest_ranges_to_iovecs<B: Bitmap + 'static>(
+    guest_ranges: &[(GuestAddress, usize)],
+    mem: &vm_memory::GuestMemoryMmap<B>,
+) -> Result<Iovecs, NetQueuePairError> {
+    guest_ranges
+        .iter()
+        .map(|(addr, len)| {
+            let buf = mem
+                .get_slice(*addr, *len)
+                .map_err(NetQueuePairError::GuestMemory)?;
+            assert!(buf.len() >= *len);
+            let buf = buf.ptr_guard_mut();
+
+            Ok(libc::iovec {
+                iov_base: buf.as_ptr().cast(),
+                iov_len: *len,
+            })
+        })
+        .collect()
+}
+
 #[derive(Clone)]
 pub struct TxVirtio {
     pub counter_bytes: Wrapping<u64>,
     pub counter_frames: Wrapping<u64>,
-    iovecs: IovecBuffer,
     host_checksum_offload: bool,
 }
 
@@ -36,7 +70,6 @@ impl TxVirtio {
         TxVirtio {
             counter_bytes: Wrapping(0),
             counter_frames: Wrapping(0),
-            iovecs: IovecBuffer::new(),
             host_checksum_offload,
         }
     }
@@ -84,11 +117,12 @@ impl TxVirtio {
 
             let mut header = [0u8; size_of::<virtio_net_hdr_v1>()];
             let mut header_len = 0;
-            let mut iovecs = self.iovecs.borrow();
-            // Parse the descriptor chain into an iovec array. On error, the
-            // offending head descriptor is still added to the used ring with
-            // len 0 below, so the guest does not see a descriptor leak.
-            let parse_result: Result<(), NetQueuePairError> = (|| {
+            // Parse the descriptor chain into iovecs. On error, the offending
+            // head descriptor is still added to the used ring with len 0
+            // below, so the guest does not see a descriptor leak.
+            let parse_result: Result<Iovecs, NetQueuePairError> = (|| {
+                let mut guest_ranges: SmallVec<[(GuestAddress, usize); CHAIN_INLINE_DESCS]> =
+                    SmallVec::new();
                 while let Some(desc) = next_desc {
                     let desc_addr = desc
                         .addr()
@@ -97,22 +131,7 @@ impl TxVirtio {
                             NetQueuePairError::GuestMemory(vm_memory::GuestMemoryError::IOError(e))
                         })?;
                     if !desc.is_write_only() && desc.len() > 0 {
-                        let buf = desc_chain
-                            .memory()
-                            .get_slice(desc_addr, desc.len() as usize)
-                            .map_err(NetQueuePairError::GuestMemory)?;
-                        assert!(buf.len() >= desc.len() as usize);
-                        // Copy the header because the guest can modify its buffers
-                        // between validation and the TAP write.
-                        let copied = buf.copy_to(&mut header[header_len..]);
-                        header_len += copied;
-                        let buf = buf.ptr_guard_mut();
-                        if copied < desc.len() as usize {
-                            iovecs.push(libc::iovec {
-                                iov_base: buf.as_ptr().wrapping_add(copied).cast(),
-                                iov_len: desc.len() as libc::size_t - copied,
-                            });
-                        }
+                        guest_ranges.push((desc_addr, desc.len() as usize));
                     } else {
                         error!(
                             "Invalid descriptor chain: address = 0x{:x} length = {} write_only = {}",
@@ -124,17 +143,36 @@ impl TxVirtio {
                     }
                     next_desc = desc_chain.next();
                 }
-                Ok(())
+                // Copy the header out of the guest ranges because the guest
+                // can modify its buffers between validation and the TAP write.
+                for (addr, len) in guest_ranges.iter_mut() {
+                    if header_len == header.len() {
+                        break;
+                    }
+                    let copied = desc_chain
+                        .memory()
+                        .get_slice(*addr, *len)
+                        .map_err(NetQueuePairError::GuestMemory)?
+                        .copy_to(&mut header[header_len..]);
+                    header_len += copied;
+                    addr.0 += copied as u64;
+                    *len -= copied;
+                }
+                guest_ranges.retain(|(_, len)| *len > 0);
+                guest_ranges_to_iovecs(&guest_ranges, desc_chain.memory())
             })();
 
-            if let Err(e) = parse_result {
-                // Surface the bad descriptor to the guest with len 0 so the
-                // used ring stays consistent before bailing.
-                queue
-                    .add_used(desc_chain.memory(), desc_chain.head_index(), 0)
-                    .map_err(NetQueuePairError::QueueAddUsed)?;
-                return Err(e);
-            }
+            let mut iovecs = match parse_result {
+                Ok(iovecs) => iovecs,
+                Err(e) => {
+                    // Surface the bad descriptor to the guest with len 0 so the
+                    // used ring stays consistent before bailing.
+                    queue
+                        .add_used(desc_chain.memory(), desc_chain.head_index(), 0)
+                        .map_err(NetQueuePairError::QueueAddUsed)?;
+                    return Err(e);
+                }
+            };
 
             if Self::tx_is_header_valid(&header, header_len, self.host_checksum_offload) {
                 iovecs.insert(
@@ -173,16 +211,9 @@ impl TxVirtio {
                         break;
                     }
 
-                    if e.raw_os_error() == Some(libc::EINVAL) {
-                        error!("net: tx: dropping malformed packet: {e}");
-                        0
-                    } else if e.raw_os_error() == Some(libc::EIO) {
-                        error!("net: tx: dropping frame, tap I/O error: {e}");
-                        0
-                    } else {
-                        error!("net: tx: failed writing to tap: {e}");
-                        return Err(NetQueuePairError::WriteTap(e));
-                    }
+                    // Like QEMU, drop the frame on any other error
+                    error!("net: tx: dropping frame, failed writing to tap: {e}");
+                    0
                 } else if (result as usize) < vnet_hdr_len() {
                     error!("net: tx: short tap write ({result} < {})", vnet_hdr_len());
                     0
@@ -225,7 +256,6 @@ impl TxVirtio {
 pub struct RxVirtio {
     pub counter_bytes: Wrapping<u64>,
     pub counter_frames: Wrapping<u64>,
-    iovecs: IovecBuffer,
 }
 
 impl Default for RxVirtio {
@@ -239,7 +269,6 @@ impl RxVirtio {
         RxVirtio {
             counter_bytes: Wrapping(0),
             counter_frames: Wrapping(0),
-            iovecs: IovecBuffer::new(),
         }
     }
 
@@ -267,14 +296,23 @@ impl RxVirtio {
                 break;
             }
 
-            let mut iovecs = self.iovecs.borrow();
-            // Parse the descriptor chain into an iovec array. On error, the
-            // offending head descriptor is still added to the used ring with
-            // len 0 below, so the guest does not see a descriptor leak.
-            let parse_result: Result<GuestAddress, NetQueuePairError> = (|| {
+            // Ranges for translation into host iovecs and for dirty tracking after readv()
+            let mut guest_ranges: SmallVec<[(GuestAddress, usize); CHAIN_INLINE_DESCS]> =
+                SmallVec::new();
+
+            // Parse the descriptor chain into iovecs. On error, the offending
+            // head descriptor is still added to the used ring with len 0
+            // below, so the guest does not see a descriptor leak.
+            let parse_result: Result<(GuestAddress, Iovecs), NetQueuePairError> = (|| {
                 let desc = desc_chain
                     .next()
                     .ok_or(NetQueuePairError::DescriptorChainTooShort)?;
+
+                // num_buffers is written into the head descriptor, so it must
+                // hold the whole virtio-net header.
+                if (desc.len() as usize) < vnet_hdr_len() {
+                    return Err(NetQueuePairError::DescriptorInvalidHeader);
+                }
 
                 let num_buffers_addr = desc_chain
                     .memory()
@@ -299,17 +337,7 @@ impl RxVirtio {
                             NetQueuePairError::GuestMemory(vm_memory::GuestMemoryError::IOError(e))
                         })?;
                     if desc.is_write_only() && desc.len() > 0 {
-                        let buf = desc_chain
-                            .memory()
-                            .get_slice(desc_addr, desc.len() as usize)
-                            .map_err(NetQueuePairError::GuestMemory)?;
-                        assert!(buf.len() >= desc.len() as usize);
-                        let buf = buf.ptr_guard_mut();
-                        let iovec = libc::iovec {
-                            iov_base: buf.as_ptr().cast(),
-                            iov_len: desc.len() as libc::size_t,
-                        };
-                        iovecs.push(iovec);
+                        guest_ranges.push((desc_addr, desc.len() as usize));
                     } else {
                         error!(
                             "Invalid descriptor chain: address = 0x{:x} length = {} write_only = {}",
@@ -321,11 +349,13 @@ impl RxVirtio {
                     }
                     next_desc = desc_chain.next();
                 }
-                Ok(num_buffers_addr)
+
+                let iovecs = guest_ranges_to_iovecs(&guest_ranges, desc_chain.memory())?;
+                Ok((num_buffers_addr, iovecs))
             })();
 
-            let num_buffers_addr = match parse_result {
-                Ok(addr) => addr,
+            let (num_buffers_addr, iovecs) = match parse_result {
+                Ok(parsed) => parsed,
                 Err(e) => {
                     queue
                         .add_used(desc_chain.memory(), desc_chain.head_index(), 0)
@@ -378,6 +408,22 @@ impl RxVirtio {
                         .map_err(NetQueuePairError::GuestMemory)?;
                     0
                 } else {
+                    // readv() bypasses dirty bitmap. Update the touched pages manually
+                    let mut remaining = result as usize;
+                    for (addr, len) in &guest_ranges {
+                        if *len == 0 {
+                            continue;
+                        }
+                        if remaining == 0 {
+                            break;
+                        }
+                        let n = remaining.min(*len);
+                        if let Ok(buf) = desc_chain.memory().get_slice(*addr, n) {
+                            buf.bitmap().mark_dirty(0, n);
+                        }
+                        remaining -= n;
+                    }
+
                     // Write num_buffers to guest memory. Always 1 because the
                     // frame is never spread over more than one descriptor chain.
                     if let Err(e) = desc_chain.memory().write_obj(1u16, num_buffers_addr) {
@@ -422,53 +468,6 @@ impl RxVirtio {
 }
 
 #[derive(Default, Clone)]
-struct IovecBuffer(Vec<libc::iovec>);
-
-// SAFETY: Implementing Send for IovecBuffer is safe as the pointer inside is iovec.
-// The iovecs are usually constructed from virtio descriptors, which are safe to send across
-// threads.
-unsafe impl Send for IovecBuffer {}
-// SAFETY: Implementing Sync for IovecBuffer is safe as the pointer inside is iovec.
-// The iovecs are usually constructed from virtio descriptors, which are safe to access from
-// multiple threads.
-unsafe impl Sync for IovecBuffer {}
-
-impl IovecBuffer {
-    fn new() -> Self {
-        // Here we use 4 as the default capacity because it is enough for most cases.
-        const DEFAULT_CAPACITY: usize = 4;
-        IovecBuffer(Vec::with_capacity(DEFAULT_CAPACITY))
-    }
-
-    fn borrow(&mut self) -> IovecBufferBorrowed<'_> {
-        IovecBufferBorrowed(&mut self.0)
-    }
-}
-
-struct IovecBufferBorrowed<'a>(&'a mut Vec<libc::iovec>);
-
-impl Deref for IovecBufferBorrowed<'_> {
-    type Target = Vec<libc::iovec>;
-
-    fn deref(&self) -> &Self::Target {
-        self.0
-    }
-}
-
-impl DerefMut for IovecBufferBorrowed<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.0
-    }
-}
-
-impl Drop for IovecBufferBorrowed<'_> {
-    fn drop(&mut self) {
-        // Clear the buffer to make sure old values are not used after
-        self.0.clear();
-    }
-}
-
-#[derive(Default, Clone)]
 pub struct NetCounters {
     pub tx_bytes: Arc<AtomicU64>,
     pub tx_frames: Arc<AtomicU64>,
@@ -482,8 +481,6 @@ pub enum NetQueuePairError {
     RegisterListener(#[source] io::Error),
     #[error("Error unregistering listener")]
     UnregisterListener(#[source] io::Error),
-    #[error("Error writing to the TAP device")]
-    WriteTap(#[source] io::Error),
     #[error("Error reading from the TAP device")]
     ReadTap(#[source] io::Error),
     #[error("Error related to guest memory")]
@@ -624,7 +621,17 @@ impl NetQueuePair {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixDatagram;
+
     use virtio_bindings::virtio_net::{VIRTIO_NET_HDR_F_DATA_VALID, VIRTIO_NET_HDR_GSO_TCPV4};
+    use virtio_bindings::virtio_ring::{VRING_DESC_F_NEXT, VRING_DESC_F_WRITE};
+    use virtio_queue::desc::RawDescriptor;
+    use virtio_queue::desc::split::Descriptor;
+    use virtio_queue::mock::MockSplitQueue;
+    use vm_memory::bitmap::AtomicBitmap;
+    use vm_memory::{GuestMemoryMmap, GuestMemoryRegion};
 
     use super::*;
 
@@ -651,5 +658,167 @@ mod tests {
         header[1] = VIRTIO_NET_HDR_GSO_TCPV4 as u8;
         assert!(!TxVirtio::tx_is_header_valid(&header, len, false));
         assert!(TxVirtio::tx_is_header_valid(&header, len, true));
+    }
+
+    #[test]
+    fn tx_drops_frame_the_tap_refuses() {
+        const HDR0: u64 = 0x10000;
+        const DATA0: u64 = 0x20000;
+        const HDR1: u64 = 0x30000;
+        const DATA1: u64 = 0x40000;
+        const SMALL_FRAME: usize = 64;
+
+        let mem =
+            GuestMemoryMmap::<AtomicBitmap>::from_ranges(&[(GuestAddress(0), 0x10_0000)]).unwrap();
+        // Two TX chains: a frame larger than the socket send buffer, then a
+        // small one
+        let vq = MockSplitQueue::new(&mem, 16);
+        vq.add_desc_chains(
+            &[
+                RawDescriptor::from(Descriptor::new(
+                    HDR0,
+                    vnet_hdr_len() as u32,
+                    VRING_DESC_F_NEXT as u16,
+                    1,
+                )),
+                RawDescriptor::from(Descriptor::new(DATA0, 0x8000, 0, 0)),
+                RawDescriptor::from(Descriptor::new(
+                    HDR1,
+                    vnet_hdr_len() as u32,
+                    VRING_DESC_F_NEXT as u16,
+                    3,
+                )),
+                RawDescriptor::from(Descriptor::new(DATA1, SMALL_FRAME as u32, 0, 0)),
+            ],
+            0,
+        )
+        .unwrap();
+        let mut queue: Queue = vq.create_queue().unwrap();
+        let (tap_end, peer) = UnixDatagram::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let sndbuf: libc::c_int = 4096;
+        // SAFETY: valid socket fd and a pointer to a c_int of the given size
+        let ret = unsafe {
+            libc::setsockopt(
+                tap_end.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&raw const sndbuf).cast(),
+                size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(ret, 0);
+        let tap = Tap::new_for_fuzzing(File::from(OwnedFd::from(tap_end)), "test");
+
+        // writev() of the first frame fails with EMSGSIZE, like a tap fails
+        // with ENOBUFS for a frame it cannot allocate. The device must drop
+        // that frame and still send the next one.
+        TxVirtio::new(false)
+            .process_desc_chain(&mem, &tap, &mut queue, &mut None, None)
+            .expect("an undeliverable frame should be dropped");
+
+        assert_eq!(u16::from_le(vq.used().idx().load()), 2);
+        for (i, head) in [(0, 0), (1, 2)] {
+            let used = vq.used().ring().ref_at(i).unwrap().load();
+            assert_eq!((used.id(), used.len()), (head, 0));
+        }
+        let mut buf = [0u8; 0x10000];
+        assert_eq!(peer.recv(&mut buf).unwrap(), vnet_hdr_len() + SMALL_FRAME);
+        assert_eq!(
+            peer.recv(&mut buf).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn rx_marks_all_written_pages_dirty() {
+        const BUF0: u64 = 0x10000;
+        const BUF1: u64 = 0x20000;
+        const FILL: u8 = 0xab;
+
+        let mem =
+            GuestMemoryMmap::<AtomicBitmap>::from_ranges(&[(GuestAddress(0), 0x10_0000)]).unwrap();
+        // One RX chain: one page at BUF0, two pages at BUF1
+        let vq = MockSplitQueue::new(&mem, 16);
+        vq.add_desc_chains(
+            &[
+                RawDescriptor::from(Descriptor::new(
+                    BUF0,
+                    0x1000,
+                    (VRING_DESC_F_WRITE | VRING_DESC_F_NEXT) as u16,
+                    1,
+                )),
+                RawDescriptor::from(Descriptor::new(BUF1, 0x2000, VRING_DESC_F_WRITE as u16, 0)),
+            ],
+            0,
+        )
+        .unwrap();
+        let mut queue: Queue = vq.create_queue().unwrap();
+        // A frame that spills from the first buffer into the second one
+        let tap = {
+            let (tx, rx) = UnixDatagram::pair().unwrap();
+            rx.set_nonblocking(true).unwrap();
+            tx.send(&[FILL; 6000]).unwrap();
+            Tap::new_for_fuzzing(File::from(OwnedFd::from(rx)), "test")
+        };
+
+        // readv() writes into guest memory through raw pointers, which the
+        // vm-memory dirty bitmap cannot see. The device must mark those bytes
+        // itself, or a live migration never resends them.
+        RxVirtio::new()
+            .process_desc_chain(&mem, &tap, &mut queue, &mut None, None)
+            .unwrap();
+
+        // readv() fills BUF0 (4096 bytes) and spills the remaining 1904 bytes into BUF1
+        assert_eq!(mem.read_obj::<u8>(GuestAddress(BUF1 + 100)).unwrap(), FILL);
+        let bitmap = mem.find_region(GuestAddress(0)).unwrap().bitmap();
+        assert!(bitmap.dirty_at(BUF0 as usize));
+        assert!(bitmap.dirty_at(BUF1 as usize));
+        // Only 6000 - 4096 bytes were written to the second buffer
+        assert!(!bitmap.dirty_at(BUF1 as usize + 0x1000));
+    }
+
+    #[test]
+    fn rx_rejects_head_shorter_than_header() {
+        const BUF0: u64 = 0x10000;
+        const BUF1: u64 = 0x20000;
+        const CANARY: u8 = 0xcd;
+
+        let mem =
+            GuestMemoryMmap::<AtomicBitmap>::from_ranges(&[(GuestAddress(0), 0x10_0000)]).unwrap();
+        mem.write_slice(&[CANARY; 16], GuestAddress(BUF0)).unwrap();
+        // One RX chain whose head holds a single byte, followed by a page
+        let vq = MockSplitQueue::new(&mem, 16);
+        vq.add_desc_chains(
+            &[
+                RawDescriptor::from(Descriptor::new(
+                    BUF0,
+                    1,
+                    (VRING_DESC_F_WRITE | VRING_DESC_F_NEXT) as u16,
+                    1,
+                )),
+                RawDescriptor::from(Descriptor::new(BUF1, 0x1000, VRING_DESC_F_WRITE as u16, 0)),
+            ],
+            0,
+        )
+        .unwrap();
+        let mut queue: Queue = vq.create_queue().unwrap();
+        let tap = {
+            let (tx, rx) = UnixDatagram::pair().unwrap();
+            rx.set_nonblocking(true).unwrap();
+            tx.send(&[0xab; 100]).unwrap();
+            Tap::new_for_fuzzing(File::from(OwnedFd::from(rx)), "test")
+        };
+
+        let result = RxVirtio::new().process_desc_chain(&mem, &tap, &mut queue, &mut None, None);
+
+        assert!(matches!(
+            result,
+            Err(NetQueuePairError::DescriptorInvalidHeader)
+        ));
+        // The device must not write num_buffers past the one byte it was given
+        let mut buf = [0u8; 16];
+        mem.read_slice(&mut buf, GuestAddress(BUF0)).unwrap();
+        assert_eq!(buf, [CANARY; 16]);
     }
 }

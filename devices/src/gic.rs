@@ -42,6 +42,7 @@ impl Gic {
         vcpu_count: u32,
         interrupt_manager: Arc<dyn InterruptManager<GroupConfig = MsiIrqGroupConfig>>,
         vm: Arc<dyn hypervisor::Vm>,
+        maintenance_irq: Option<u32>,
     ) -> Result<Gic> {
         let interrupt_source_group = interrupt_manager
             .create_group(MsiIrqGroupConfig {
@@ -50,7 +51,8 @@ impl Gic {
             })
             .map_err(Error::CreateInterruptSourceGroup)?;
 
-        let config = Gic::create_default_config(vcpu_count as u64);
+        let mut config = Gic::create_default_config(vcpu_count as u64)?;
+        config.maintenance_irq = maintenance_irq;
         let vgic = vm.create_vgic(&config).map_err(Error::CreateGic)?;
 
         let gic = Gic {
@@ -98,10 +100,16 @@ impl Gic {
     }
 
     /// Default config implied by arch::layout
-    pub fn create_default_config(vcpu_count: u64) -> VgicConfig {
+    pub fn create_default_config(vcpu_count: u64) -> Result<VgicConfig> {
+        if vcpu_count > layout::GIC_V3_LAYOUT_MAX_VCPUS {
+            return Err(Error::GicTooManyVcpus(
+                vcpu_count,
+                layout::GIC_V3_LAYOUT_MAX_VCPUS,
+            ));
+        }
         let redists_size = layout::GIC_V3_REDIST_SIZE * vcpu_count;
         let redists_addr = layout::GIC_V3_DIST_START.raw_value() - redists_size;
-        VgicConfig {
+        Ok(VgicConfig {
             vcpu_count,
             dist_addr: layout::GIC_V3_DIST_START.raw_value(),
             dist_size: layout::GIC_V3_DIST_SIZE,
@@ -110,7 +118,8 @@ impl Gic {
             msi_addr: redists_addr - layout::GIC_V3_ITS_SIZE,
             msi_size: layout::GIC_V3_ITS_SIZE,
             nr_irqs: layout::IRQ_NUM,
-        }
+            maintenance_irq: None,
+        })
     }
 
     pub fn get_vgic(&mut self) -> Result<Arc<Mutex<dyn Vgic>>> {
@@ -156,3 +165,34 @@ impl Pausable for Gic {
 }
 impl Transportable for Gic {}
 impl Migratable for Gic {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_create_default_config_limit() {
+        let floor = layout::UEFI_START.raw_value() + layout::UEFI_SIZE;
+        let limit = layout::GIC_V3_LAYOUT_MAX_VCPUS;
+
+        // At the limit the ITS clears the UEFI flash, and one more
+        // Redistributor frame would push it into the flash.
+        let config = Gic::create_default_config(limit).unwrap();
+        assert!(config.msi_addr >= floor);
+        assert!(config.msi_addr - layout::GIC_V3_REDIST_SIZE < floor);
+
+        assert!(matches!(
+            Gic::create_default_config(limit + 1),
+            Err(Error::GicTooManyVcpus(n, l)) if n == limit + 1 && l == limit
+        ));
+        // Counts whose layout would have wrapped below address 0 are refused
+        // too, rather than wrapping or panicking.
+        let wraps = layout::GIC_V3_DIST_START.raw_value() / layout::GIC_V3_REDIST_SIZE + 1;
+        for n in [wraps, u64::MAX] {
+            assert!(matches!(
+                Gic::create_default_config(n),
+                Err(Error::GicTooManyVcpus(..))
+            ));
+        }
+    }
+}

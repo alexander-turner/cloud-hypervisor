@@ -4,35 +4,40 @@
 //
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 
+use std::fs::File;
 use std::os::unix::io::AsRawFd;
 
 use vmm_sys_util::eventfd::EventFd;
 
-use super::{operation_is_aligned, run_unaligned_operation};
 use crate::async_io::{
     AsyncIo, AsyncIoCompletion, AsyncIoError, AsyncIoOperation, AsyncIoResult, UringDataIo,
 };
 use crate::error::{BlockError, BlockErrorKind, BlockResult};
 use crate::sparse::{punch_hole, write_zeroes};
-use crate::{AlignedFile, is_block_device};
+use crate::{SECTOR_SIZE, is_block_device, probe_direct_alignment};
 
 pub(crate) struct RawAsync {
-    raw_file: AlignedFile,
+    // Drop before raw_file so pending SQEs can be submitted while its fd is valid.
     data_io: UringDataIo,
-    alignment: u64,
+    raw_file: File,
+    alignment: Option<u64>,
     is_block_device: bool,
 }
 
 impl RawAsync {
-    pub(crate) fn new(raw_file: AlignedFile, ring_depth: u32) -> BlockResult<Self> {
+    pub(crate) fn new(raw_file: File, direct: bool, ring_depth: u32) -> BlockResult<Self> {
         let data_io =
             UringDataIo::new(ring_depth).map_err(|e| BlockError::new(BlockErrorKind::Io, e))?;
-        let is_block_device = is_block_device(raw_file.as_raw_fd());
-        let alignment = raw_file.alignment() as u64;
+        let is_block_device = is_block_device(&raw_file);
+        let alignment = if direct {
+            Some(probe_direct_alignment(&raw_file).unwrap_or(SECTOR_SIZE))
+        } else {
+            None
+        };
 
         Ok(RawAsync {
-            raw_file,
             data_io,
+            raw_file,
             alignment,
             is_block_device,
         })
@@ -44,29 +49,21 @@ impl AsyncIo for RawAsync {
         self.data_io.notifier()
     }
 
-    fn alignment(&self) -> u64 {
+    fn alignment(&self) -> Option<u64> {
         self.alignment
     }
 
     fn submit_data_operation(&mut self, op: AsyncIoOperation) -> AsyncIoResult<()> {
         let is_read = op.is_read();
 
-        if operation_is_aligned(&op, self.alignment) {
-            let fd = self.raw_file.as_raw_fd();
-            return self.data_io.submit_operation(fd, op).map_err(|e| {
-                if is_read {
-                    AsyncIoError::ReadVectored(e)
-                } else {
-                    AsyncIoError::WriteVectored(e)
-                }
-            });
-        }
-
-        let result = run_unaligned_operation(&self.raw_file, &op)?;
-        self.data_io
-            .inject_completion(AsyncIoCompletion::from_operation(op, result));
-
-        Ok(())
+        let fd = self.raw_file.as_raw_fd();
+        self.data_io.submit_operation(fd, op).map_err(|e| {
+            if is_read {
+                AsyncIoError::ReadVectored(e)
+            } else {
+                AsyncIoError::WriteVectored(e)
+            }
+        })
     }
 
     fn fsync(&mut self, user_data: Option<u64>) -> AsyncIoResult<()> {
@@ -76,8 +73,7 @@ impl AsyncIo for RawAsync {
                 .submit_fsync(fd, user_data)
                 .map_err(AsyncIoError::Fsync)?;
         } else {
-            // SAFETY: FFI call with a valid fd
-            unsafe { libc::fsync(fd) };
+            self.raw_file.sync_all().map_err(AsyncIoError::Fsync)?;
         }
 
         Ok(())
@@ -92,26 +88,6 @@ impl AsyncIo for RawAsync {
     }
 
     fn submit_batch_requests(&mut self, batch_request: Vec<AsyncIoOperation>) -> AsyncIoResult<()> {
-        if self.alignment != 0 {
-            let mut aligned_batch = Vec::with_capacity(batch_request.len());
-            for op in batch_request {
-                if operation_is_aligned(&op, self.alignment) {
-                    aligned_batch.push(op);
-                } else {
-                    let result = run_unaligned_operation(&self.raw_file, &op)?;
-                    self.data_io
-                        .inject_completion(AsyncIoCompletion::from_operation(op, result));
-                }
-            }
-            if aligned_batch.is_empty() {
-                return Ok(());
-            }
-            return self
-                .data_io
-                .submit_batch(self.raw_file.as_raw_fd(), aligned_batch)
-                .map_err(AsyncIoError::SubmitBatchRequests);
-        }
-
         self.data_io
             .submit_batch(self.raw_file.as_raw_fd(), batch_request)
             .map_err(AsyncIoError::SubmitBatchRequests)

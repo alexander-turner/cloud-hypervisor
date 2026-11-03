@@ -137,7 +137,7 @@ pub(crate) fn prepare_virtiofsd(tmp_dir: &TempDir, shared_dir: &str) -> (Child, 
 pub(crate) fn prepare_vubd(
     tmp_dir: &TempDir,
     blk_img: &str,
-    num_queues: usize,
+    num_queues: u16,
     rdonly: bool,
     direct: bool,
 ) -> (Child, String) {
@@ -245,7 +245,7 @@ pub(crate) fn prepare_vhost_user_net_daemon(
     tap: Option<&str>,
     mac: Option<&str>,
     mtu: Option<u16>,
-    num_queues: usize,
+    num_queues: u16,
     client_mode: bool,
 ) -> (Command, String) {
     let vunet_socket_path = String::from(tmp_dir.as_path().join("vunet.sock").to_str().unwrap());
@@ -431,11 +431,7 @@ pub(crate) fn setup_ovs_dpdk_guests(
         .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
         .args(["--net", guest1.default_net_string().as_str(), OVS_DPDK_NET1])
         .capture_output();
-    if release_binary {
-        cmd1.legacy_default_disks();
-    } else {
-        cmd1.default_disks();
-    }
+    cmd1.default_disks();
     let mut child1 = cmd1.spawn().unwrap();
 
     #[cfg(target_arch = "x86_64")]
@@ -488,10 +484,9 @@ pub(crate) fn setup_ovs_dpdk_guests(
         .args(["--net", guest2.default_net_string().as_str(), OVS_DPDK_NET2])
         .capture_output();
     if release_binary {
-        cmd2.args(["--seccomp", "false"]).legacy_default_disks();
-    } else {
-        cmd2.default_disks();
+        cmd2.args(["--seccomp", "false"]);
     }
+    cmd2.default_disks();
     let mut child2 = cmd2.spawn().unwrap();
 
     let r = panic::catch_unwind(|| {
@@ -547,7 +542,7 @@ pub(crate) fn fw_path(_fw_type: FwType) -> String {
 
 /// Parse the event_monitor file based on the format that each event
 /// is followed by a double newline
-fn parse_event_file(event_file: &str) -> Vec<serde_json::Value> {
+pub(crate) fn parse_event_file(event_file: &str) -> Vec<serde_json::Value> {
     let content = fs::read(event_file).unwrap();
     String::from_utf8_lossy(&content)
         .trim()
@@ -718,15 +713,8 @@ pub(super) fn get_msi_interrupt_pattern() -> String {
     }
 }
 
-pub(super) type PrepareNetDaemon = dyn Fn(
-    &TempDir,
-    &str,
-    Option<&str>,
-    Option<&str>,
-    Option<u16>,
-    usize,
-    bool,
-) -> (Command, String);
+pub(super) type PrepareNetDaemon =
+    dyn Fn(&TempDir, &str, Option<&str>, Option<&str>, Option<u16>, u16, bool) -> (Command, String);
 
 pub(super) fn get_ksm_pages_shared() -> u32 {
     fs::read_to_string("/sys/kernel/mm/ksm/pages_shared")

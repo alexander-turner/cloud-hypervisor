@@ -6,17 +6,17 @@
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
 use std::os::fd::BorrowedFd;
+#[cfg(feature = "kvm")]
+use std::os::fd::OwnedFd;
 use std::os::unix::io::AsRawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier, Mutex};
 use std::{cmp, io, result};
 
 use anyhow::{Context, anyhow};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use byteorder::{ByteOrder, LittleEndian};
 use hypervisor::HypervisorVmError;
-use libc::{_SC_PAGESIZE, sysconf};
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -33,6 +33,8 @@ use vfio_bindings::bindings::vfio::{
 use vfio_ioctls::{
     DmaLoggingRange, VfioDevice, VfioIrq, VfioOps, VfioRegionInfoCap, VfioRegionSparseMmapArea,
 };
+#[cfg(feature = "kvm")]
+use vfio_ioctls::{VfioIommufd, VfioRegionDmaRange};
 use vm_allocator::page_size::{
     align_page_size_down, align_page_size_up, get_page_size, is_4k_aligned, is_4k_multiple,
     is_page_size_aligned,
@@ -60,8 +62,8 @@ use crate::configuration::{
     PCI_EXT_CAP_ALIGN, PCI_EXT_CAP_NEXT_MASK, PCI_EXT_CAP_NEXT_SHIFT, PCIE_CONFIG_SPACE_SIZE,
 };
 use crate::mmap::MmapRegion;
-use crate::msi::{MSI_CONFIG_ID, MsiConfigState};
-use crate::msix::{MaybeMutInterruptSourceGroup, MsixConfigState};
+use crate::msi::{Error as MsiError, MSI_CONFIG_ID, MsiConfigState};
+use crate::msix::{Error as MsixError, MaybeMutInterruptSourceGroup, MsixConfigState};
 use crate::{
     BarReprogrammingParams, MSIX_CONFIG_ID, MSIX_TABLE_ENTRY_SIZE, MsiCap, MsiConfig, MsixCap,
     MsixConfig, PCI_CONFIGURATION_ID, PciBarConfiguration, PciBarPrefetchable, PciBarRegionType,
@@ -79,6 +81,9 @@ pub enum VfioPciError {
     CreateUserMemoryRegion(#[source] HypervisorVmError),
     #[error("Failed to DMA map: {0} for device {1} (guest BDF: {2})")]
     DmaMap(#[source] vfio_ioctls::VfioError, PathBuf, PciBdf),
+    #[cfg(feature = "kvm")]
+    #[error("Failed to map the dma-buf of device {1:?} at {2}")]
+    DmaMapFile(#[source] iommufd_ioctls::IommufdError, PathBuf, PciBdf),
     #[error("Failed to DMA unmap: {0} for device {1} (guest BDF: {2})")]
     DmaUnmap(#[source] vfio_ioctls::VfioError, PathBuf, PciBdf),
     #[error("Failed to enable INTx")]
@@ -87,6 +92,14 @@ pub enum VfioPciError {
     EnableMsi(#[source] VfioError),
     #[error("Failed to enable MSI-x")]
     EnableMsix(#[source] VfioError),
+    #[error("Failed to create MSI interrupt group")]
+    CreateMsiInterruptGroup(#[source] io::Error),
+    #[error("Failed to create MSI-X interrupt group")]
+    CreateMsixInterruptGroup(#[source] io::Error),
+    #[error("Failed to initialize MSI")]
+    InitializeMsi(#[source] MsiError),
+    #[error("Failed to initialize MSI-X")]
+    InitializeMsix(#[source] MsixError),
     #[error("Failed to mmap the area")]
     MmapArea,
     #[error("Failed to notifier's eventfd")]
@@ -96,13 +109,13 @@ pub enum VfioPciError {
     #[error("Invalid region size")]
     RegionSize,
     #[error("Failed to retrieve MsiConfigState")]
-    RetrieveMsiConfigState(#[source] anyhow::Error),
+    RetrieveMsiConfigState(#[source] MigratableError),
     #[error("Failed to retrieve MsixConfigState")]
-    RetrieveMsixConfigState(#[source] anyhow::Error),
+    RetrieveMsixConfigState(#[source] MigratableError),
     #[error("Failed to retrieve PciConfigurationState")]
-    RetrievePciConfigurationState(#[source] anyhow::Error),
+    RetrievePciConfigurationState(#[source] MigratableError),
     #[error("Failed to retrieve VfioCommonState")]
-    RetrieveVfioCommonState(#[source] anyhow::Error),
+    RetrieveVfioCommonState(#[source] MigratableError),
     #[error("No space left for the extended capability {0:#x}")]
     ExtendedCapNoSpace(u16),
     #[error("Mismatched dwords and write masks for the extended capability {0:#x}")]
@@ -190,13 +203,17 @@ impl VfioMsix {
         let old_enabled = self.bar.enabled();
 
         // Update "Message Control" word
-        if offset == 2 && data.len() == 2 {
-            let data = LittleEndian::read_u16(data);
+        if offset == 2
+            && let Ok(data) = <[u8; 2]>::try_from(data)
+        {
+            let data = u16::from_le_bytes(data);
             self.bar.set_msg_ctl(data);
             self.cap.set_msg_ctl(data);
-        } else if offset == 0 && data.len() == 4 {
+        } else if offset == 0
+            && let Ok(data) = <[u8; 4]>::try_from(data)
+        {
             // Some guests update MSI-X control through the dword config write path.
-            let data = (LittleEndian::read_u32(data) >> 16) as u16;
+            let data = (u32::from_le_bytes(data) >> 16) as u16;
             self.bar.set_msg_ctl(data);
             self.cap.set_msg_ctl(data);
         }
@@ -304,6 +321,64 @@ pub(crate) struct UserMemoryRegion {
     pub slot: u32,
     pub start: u64,
     pub mapping: Arc<MmapRegion>,
+    #[cfg(feature = "kvm")]
+    pub dma_buf: Option<Arc<OwnedFd>>,
+}
+
+impl UserMemoryRegion {
+    #[cfg_attr(not(feature = "kvm"), expect(unused_variables))]
+    fn map_for_p2p(
+        &mut self,
+        device: &VfioDevice,
+        vfio_ops: &Arc<dyn VfioOps>,
+        device_path: &Path,
+        bdf: PciBdf,
+        region_index: u32,
+        offset: u64,
+    ) -> Result<(), VfioPciError> {
+        let iova = self.start;
+        let length = self.mapping.len();
+
+        #[cfg(feature = "kvm")]
+        if let Some(vfio_iommufd) = vfio_ops.as_any().downcast_ref::<VfioIommufd>()
+            && let Some(dma_buf) = device
+                .export_dma_buf(
+                    region_index,
+                    &[VfioRegionDmaRange {
+                        offset,
+                        length: length as u64,
+                    }],
+                    libc::O_RDWR as u32,
+                )
+                .map_err(|e| VfioPciError::DmaMap(e, device_path.to_path_buf(), bdf))?
+        {
+            debug!(
+                "Mapped region {region_index} of device {bdf} at 0x{iova:x} \
+                 (0x{length:x} bytes) through dma-buf"
+            );
+
+            vfio_iommufd
+                .ioas()
+                .map_file(dma_buf.as_raw_fd(), 0, length as u64, iova, true)
+                .map_err(|e| VfioPciError::DmaMapFile(e, device_path.to_path_buf(), bdf))?;
+
+            self.dma_buf = Some(Arc::new(OwnedFd::from(dma_buf)));
+
+            return Ok(());
+        }
+
+        debug!(
+            "Mapped region {region_index} of device {bdf} at 0x{iova:x} \
+             (0x{length:x} bytes) through VFIO dma map since dma-buf isn't \
+             available"
+        );
+
+        // SAFETY: MmapRegion invariants guarantee that self.mapping.addr()
+        // points to self.mapping.len() bytes of valid memory that will only
+        // be unmapped with munmap().
+        unsafe { vfio_ops.vfio_dma_map(self.start, self.mapping.len(), self.mapping.addr()) }
+            .map_err(|e| VfioPciError::DmaMap(e, device_path.to_path_buf(), bdf))
+    }
 }
 
 #[derive(Clone)]
@@ -316,6 +391,11 @@ pub struct MmioRegion {
 }
 
 impl MmioRegion {
+    /// Whether the BAR can be mapped for peer to peer DMA.
+    fn is_p2p_mappable(&self) -> bool {
+        self.length >= get_page_size()
+    }
+
     /// Returns true if this region has the exact same memory slots as the other region.
     pub fn has_matching_slots(&self, other: &MmioRegion) -> bool {
         self.user_memory_regions.len() == other.user_memory_regions.len()
@@ -672,15 +752,21 @@ struct VfioMigrationData {
     blob: String,
 }
 
+/// Patch for a PCI config space register
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct ConfigPatch {
+    /// Mask for identifying emulated parts of the register. A set bit means
+    /// emulated and a cleared bit means read from the device
     mask: u32,
+    /// Emulated value only meaningful for the bits set in `mask`
     patch: u32,
-    write_mask: u32,
+    /// Set bits can't be written by the guest. Cleared bits can but it
+    /// depends on `mask` if the write is propagated to the device or not
+    readonly_mask: u32,
 }
 
 impl ConfigPatch {
-    fn write(&mut self, offset: u64, data: &[u8]) {
+    fn write<'a>(&mut self, offset: u64, data: &'a [u8]) -> Vec<(u64, &'a [u8])> {
         let mut bytes = self.patch.to_le_bytes();
 
         for (i, byte) in data.iter().enumerate() {
@@ -691,7 +777,31 @@ impl ConfigPatch {
         }
 
         let written = u32::from_le_bytes(bytes);
-        self.patch = (self.patch & !self.write_mask) | (written & self.write_mask);
+        let writable = !self.readonly_mask;
+        let patched = self.mask & writable;
+        self.patch = (self.patch & !patched) | (written & patched);
+
+        let forwarded = (!self.mask & writable).to_le_bytes();
+        let is_forwarded = |index: usize| forwarded.get(offset as usize + index) == Some(&0xff);
+
+        let mut device_writes = Vec::new();
+        let mut index = 0;
+
+        while index < data.len() {
+            if !is_forwarded(index) {
+                index += 1;
+                continue;
+            }
+
+            let start = index;
+            while index < data.len() && is_forwarded(index) {
+                index += 1;
+            }
+
+            device_writes.push((offset + start as u64, &data[start..index]));
+        }
+
+        device_writes
     }
 }
 
@@ -729,11 +839,7 @@ impl VfioCommon {
         config: VfioCommonConfig,
     ) -> Result<Self, VfioPciError> {
         let pci_configuration_state = vm_migration::state_from_id(snapshot, PCI_CONFIGURATION_ID)
-            .map_err(|e| {
-            VfioPciError::RetrievePciConfigurationState(anyhow!(
-                "Failed to get PciConfigurationState from Snapshot: {e}"
-            ))
-        })?;
+            .map_err(VfioPciError::RetrievePciConfigurationState)?;
 
         let configuration = PciConfiguration::new(
             0,
@@ -793,21 +899,11 @@ impl VfioCommon {
             .as_ref()
             .map(|s| s.to_state())
             .transpose()
-            .map_err(|e| {
-                VfioPciError::RetrieveVfioCommonState(anyhow!(
-                    "Failed to get VfioCommonState from Snapshot: {e}"
-                ))
-            })?;
-        let msi_state = vm_migration::state_from_id(snapshot, MSI_CONFIG_ID).map_err(|e| {
-            VfioPciError::RetrieveMsiConfigState(anyhow!(
-                "Failed to get MsiConfigState from Snapshot: {e}"
-            ))
-        })?;
-        let msix_state = vm_migration::state_from_id(snapshot, MSIX_CONFIG_ID).map_err(|e| {
-            VfioPciError::RetrieveMsixConfigState(anyhow!(
-                "Failed to get MsixConfigState from Snapshot: {e}"
-            ))
-        })?;
+            .map_err(VfioPciError::RetrieveVfioCommonState)?;
+        let msi_state = vm_migration::state_from_id(snapshot, MSI_CONFIG_ID)
+            .map_err(VfioPciError::RetrieveMsiConfigState)?;
+        let msix_state = vm_migration::state_from_id(snapshot, MSIX_CONFIG_ID)
+            .map_err(VfioPciError::RetrieveMsixConfigState)?;
 
         if let Some(state) = state.as_ref() {
             let mig: Option<VfioMigrationData> =
@@ -1010,11 +1106,7 @@ impl VfioCommon {
                         .allocate(
                             restored_bar_addr,
                             region_size,
-                            Some(cmp::max(
-                                // SAFETY: FFI call. Trivially safe.
-                                unsafe { sysconf(_SC_PAGESIZE) as GuestUsize },
-                                region_size,
-                            )),
+                            Some(cmp::max(get_page_size(), region_size)),
                         )
                         .ok_or(PciDeviceError::IoAllocationFailed(region_size))?
                 }
@@ -1102,14 +1194,14 @@ impl VfioCommon {
         cap_offset: u32,
         bdf: PciBdf,
         state: Option<MsixConfigState>,
-    ) {
+    ) -> Result<(), VfioPciError> {
         let interrupt_source_group = self
             .msi_interrupt_manager
             .create_group(MsiIrqGroupConfig {
                 base: 0,
                 count: msix_cap.table_size() as InterruptIndex,
             })
-            .unwrap();
+            .map_err(VfioPciError::CreateMsixInterruptGroup)?;
 
         let msix_config = MsixConfig::new(
             msix_cap.table_size(),
@@ -1117,7 +1209,7 @@ impl VfioCommon {
             bdf.into(),
             state,
         )
-        .unwrap();
+        .map_err(VfioPciError::InitializeMsix)?;
 
         self.interrupt.msix = Some(VfioMsix {
             bar: msix_config,
@@ -1125,29 +1217,36 @@ impl VfioCommon {
             cap_offset,
             interrupt_source_group,
         });
+        Ok(())
     }
 
     fn parse_msi_capabilities(&mut self, cap: u8) -> u16 {
         self.vfio_wrapper.read_config_word((cap + 2).into())
     }
 
-    fn initialize_msi(&mut self, msg_ctl: u16, cap_offset: u32, state: Option<MsiConfigState>) {
+    fn initialize_msi(
+        &mut self,
+        msg_ctl: u16,
+        cap_offset: u32,
+        state: Option<MsiConfigState>,
+    ) -> Result<(), VfioPciError> {
         let interrupt_source_group = self
             .msi_interrupt_manager
             .create_group(MsiIrqGroupConfig {
                 base: 0,
                 count: msi_num_enabled_vectors(msg_ctl) as InterruptIndex,
             })
-            .unwrap();
+            .map_err(VfioPciError::CreateMsiInterruptGroup)?;
 
-        let msi_config =
-            MsiConfig::new(msg_ctl, Arc::clone(&interrupt_source_group), state).unwrap();
+        let msi_config = MsiConfig::new(msg_ctl, Arc::clone(&interrupt_source_group), state)
+            .map_err(VfioPciError::InitializeMsi)?;
 
         self.interrupt.msi = Some(VfioMsi {
             cfg: msi_config,
             cap_offset,
             interrupt_source_group,
         });
+        Ok(())
     }
 
     /// Returns true, if the device claims to have a PCI capability list.
@@ -1208,7 +1307,7 @@ impl VfioCommon {
                         // Parse capability only if the VFIO device
                         // supports MSI.
                         let msg_ctl = self.parse_msi_capabilities(cap_iter);
-                        self.initialize_msi(msg_ctl, cap_iter as u32, None);
+                        self.initialize_msi(msg_ctl, cap_iter as u32, None)?;
                     }
                 }
                 PciCapabilityId::MsiX => {
@@ -1218,7 +1317,7 @@ impl VfioCommon {
                         // Parse capability only if the VFIO device
                         // supports MSI-X.
                         let msix_cap = self.parse_msix_capabilities(cap_iter);
-                        self.initialize_msix(msix_cap, cap_iter as u32, bdf, None);
+                        self.initialize_msix(msix_cap, cap_iter as u32, bdf, None)?;
                     }
                 }
                 PciCapabilityId::PciExpress => {
@@ -1263,16 +1362,25 @@ impl VfioCommon {
         Ok(())
     }
 
-    fn patch_reg(&mut self, reg_idx: usize, mask: u32, patch: u32, write_mask: u32) {
+    fn patch_reg(&mut self, reg_idx: usize, mask: u32, patch: u32, readonly_mask: u32) {
         let entry = self.patches.entry(reg_idx).or_insert(ConfigPatch {
             mask: 0,
             patch: 0,
-            write_mask: 0,
+            readonly_mask: 0,
         });
 
         entry.mask |= mask;
         entry.patch = (entry.patch & !mask) | (patch & mask);
-        entry.write_mask |= write_mask;
+        entry.readonly_mask |= readonly_mask;
+
+        let forwarded = !entry.mask & !entry.readonly_mask;
+        assert!(
+            forwarded
+                .to_le_bytes()
+                .iter()
+                .all(|byte| *byte == 0x00 || *byte == 0xff),
+            "register {reg_idx:#x} leaves a byte part written by the guest: {forwarded:#010x}"
+        );
     }
 
     fn add_nv_gpudirect_clique_cap(&mut self, cap_iter: u8, clique_id: u8) {
@@ -1280,34 +1388,44 @@ impl VfioCommon {
         // at 0xD4 for this capability.
         let cap_offset = 0xd4u32;
 
-        self.patch_reg((cap_iter / 4) as usize, 0x0000_ff00, cap_offset << 8, 0);
+        self.patch_reg(
+            (cap_iter / 4) as usize,
+            0x0000_ff00,
+            cap_offset << 8,
+            0x0000_ff00,
+        );
 
         let reg_idx = (cap_offset / 4) as usize;
-        self.patch_reg(reg_idx, 0xffff_ffff, 0x50080009u32, 0);
+        self.patch_reg(reg_idx, 0xffff_ffff, 0x50080009u32, 0xffff_ffff);
         self.patch_reg(
             reg_idx + 1,
             0xffff_ffff,
             (u32::from(clique_id) << 19) | 0x5032,
-            0,
+            0xffff_ffff,
         );
     }
 
     fn present_as_integrated_endpoint(&mut self, cap_offset: u8) {
         let reg_idx = (u32::from(cap_offset) / 4) as usize;
 
-        self.patch_reg(reg_idx, PCI_EXP_FLAGS_TYPE_MASK, PCI_EXP_TYPE_RC_END, 0);
+        self.patch_reg(
+            reg_idx,
+            PCI_EXP_FLAGS_TYPE_MASK,
+            PCI_EXP_TYPE_RC_END,
+            0xffff_0000,
+        );
 
-        let clear = |this: &mut Self, reg: u32| {
-            this.patch_reg(reg_idx + (reg / 4) as usize, 0xffff_ffff, 0, 0);
+        let clear_lnkctl_reg = |this: &mut Self, reg: u32| {
+            this.patch_reg(reg_idx + (reg / 4) as usize, 0x0000_ffff, 0, 0xffff_ffff);
         };
 
-        clear(self, PCI_EXP_LNKCTL);
+        clear_lnkctl_reg(self, PCI_EXP_LNKCTL);
 
         let flags = self.vfio_wrapper.read_config_dword(u32::from(cap_offset));
         let version = (flags & PCI_EXP_FLAGS_VERS_MASK) >> PCI_EXP_FLAGS_VERS_SHIFT;
 
         if version > 1 {
-            clear(self, PCI_EXP_LNKCTL2);
+            clear_lnkctl_reg(self, PCI_EXP_LNKCTL2);
         }
     }
 
@@ -1316,7 +1434,7 @@ impl VfioCommon {
             (offset / 4) as usize,
             PCI_EXT_CAP_NEXT_MASK,
             next << PCI_EXT_CAP_NEXT_SHIFT,
-            0,
+            0xffff_ffff,
         );
     }
 
@@ -1353,12 +1471,12 @@ impl VfioCommon {
             reg_idx,
             0xffff_ffff,
             (cap.id() as u32) | (cap.version() << 16),
-            0,
+            0xffff_ffff,
         );
 
         for (dword, write_mask) in cap.dwords().iter().zip(cap.write_masks()) {
             reg_idx += 1;
-            self.patch_reg(reg_idx, 0xffff_ffff, *dword, *write_mask);
+            self.patch_reg(reg_idx, 0xffff_ffff, *dword, !*write_mask);
         }
 
         Ok(())
@@ -1408,7 +1526,7 @@ impl VfioCommon {
                         0xffff_ffff,
                         (PciExpressCapabilityId::NullCapability as u32)
                             | (u32::from(cap_next) << PCI_EXT_CAP_NEXT_SHIFT),
-                        0,
+                        0xffff_ffff,
                     ),
                 },
                 _ => last_kept_offset = Some(current_offset),
@@ -1649,13 +1767,18 @@ impl VfioCommon {
             );
         }
 
-        if let Some(patch) = self.patches.get_mut(&reg_idx) {
-            patch.write(offset, data);
+        let device_writes = match self.patches.get_mut(&reg_idx) {
+            Some(patch) => {
+                let device_writes = patch.write(offset, data);
 
-            if patch.mask == 0xffff_ffff {
-                return (Vec::new(), None);
+                if patch.mask == 0xffff_ffff {
+                    return (Vec::new(), None);
+                }
+
+                device_writes
             }
-        }
+            None => vec![(offset, data)],
+        };
 
         let reg = (reg_idx * PCI_CONFIG_REGISTER_SIZE) as u64;
 
@@ -1688,7 +1811,9 @@ impl VfioCommon {
         // enabling this bit, we first need to enable the MSI interrupts with
         // VFIO through VFIO_DEVICE_SET_IRQS ioctl, and only after we can write
         // to the device region to update the MSI Enable bit.
-        self.vfio_wrapper.write_config((reg + offset) as u32, data);
+        for (offset, data) in device_writes {
+            self.vfio_wrapper.write_config((reg + offset) as u32, data);
+        }
 
         // The non BAR write path goes directly to the VFIO device and not the shadow,
         // so the PciConfiguration shadow can get stale. Mirror the write into the
@@ -1705,9 +1830,10 @@ impl VfioCommon {
             2 => self
                 .configuration
                 .write_word(byte_offset, u16::from(data[0]) | (u16::from(data[1]) << 8)),
-            4 => self
-                .configuration
-                .write_reg(reg_idx, LittleEndian::read_u32(data)),
+            4 => self.configuration.write_reg(
+                reg_idx,
+                u32::from_le_bytes(data.try_into().expect("data should be 4 bytes")),
+            ),
             _ => {}
         }
 
@@ -1742,8 +1868,9 @@ impl VfioCommon {
             return self.configuration.read_reg(reg_idx);
         }
 
-        if let Some(id) = self.get_msix_cap_idx() {
-            let msix = self.interrupt.msix.as_mut().unwrap();
+        if let Some(id) = self.get_msix_cap_idx()
+            && let Some(msix) = &self.interrupt.msix
+        {
             if reg_idx * 4 == id + 4 {
                 return msix.cap.table;
             } else if reg_idx * 4 == id + 8 {
@@ -1823,11 +1950,11 @@ impl VfioCommon {
         }
 
         if let Some(msi) = &state.msi_state {
-            self.initialize_msi(msi.cap.msg_ctl, msi.cap_offset, msi_state);
+            self.initialize_msi(msi.cap.msg_ctl, msi.cap_offset, msi_state)?;
         }
 
         if let Some(msix) = &state.msix_state {
-            self.initialize_msix(msix.cap, msix.cap_offset, msix.bdf.into(), msix_state);
+            self.initialize_msix(msix.cap, msix.cap_offset, msix.bdf.into(), msix_state)?;
         }
 
         // Replay the opaque device state captured at snapshot. The kernel walks
@@ -2067,6 +2194,7 @@ pub struct VfioPciDevice {
     // Whether to map VFIO device MMIO BARs into the host IOMMU address space.
     // Required for peer-to-peer DMA between VFIO devices.
     p2p_dma: bool,
+    p2p_dma_mapped: bool,
     memory_slot_allocator: MemorySlotAllocator,
     // Guest memory layout, used to enumerate the IOVA ranges to track when
     // programming VFIO DMA logging.
@@ -2120,6 +2248,7 @@ impl VfioPciDevice {
             common,
             iommu_attached,
             p2p_dma,
+            p2p_dma_mapped: false,
             memory_slot_allocator,
             memory,
             bdf,
@@ -2300,6 +2429,15 @@ impl VfioPciDevice {
                 )?;
 
                 let page_size = get_page_size();
+                let map_p2p = self.p2p_dma && region.is_p2p_mappable();
+                if self.p2p_dma && !map_p2p {
+                    warn!(
+                        "Skipping P2P DMA mapping of BAR {} of device {}: its size \
+                         0x{:x} is smaller than the host page size 0x{page_size:x}",
+                        region.index, self.bdf, region.length
+                    );
+                }
+
                 for area in sparse_areas.iter() {
                     // KVM_SET_USER_MEMORY_REGION requires memory_size to be a
                     // multiple of the host page size. On aarch64 with 64K pages
@@ -2350,10 +2488,12 @@ impl VfioPciDevice {
                         }
                     };
 
-                    let user_memory_region = UserMemoryRegion {
+                    let mut user_memory_region = UserMemoryRegion {
                         slot: self.memory_slot_allocator.next_memory_slot(),
                         start: region.start.0 + area.offset,
                         mapping: Arc::new(mapping),
+                        #[cfg(feature = "kvm")]
+                        dma_buf: None,
                     };
                     // SAFETY: MmapRegion invariants guarantee that
                     // user_memory_region.mapping.addr() points to
@@ -2374,27 +2514,84 @@ impl VfioPciDevice {
 
                     // Map the MMIO BAR into the host IOMMU address space via VfioOps
                     // Only needed if p2p_dma is enabled.
-                    if self.p2p_dma {
-                        // vfio_dma_map should be unsafe but isn't.
-                        // SAFETY: MmapRegion invariants guarantee that
-                        // user_memory_region.mapping.addr() points to
-                        // user_memory_region.mapping.len() bytes of
-                        // valid memory that will only be unmapped with munmap().
-                        unsafe {
-                            self.vfio_ops.vfio_dma_map(
-                                user_memory_region.start,
-                                user_memory_region.mapping.len(),
-                                user_memory_region.mapping.addr(),
-                            )
-                        }
-                        .map_err(|e| VfioPciError::DmaMap(e, self.device_path.clone(), self.bdf))?;
+                    if map_p2p {
+                        user_memory_region.map_for_p2p(
+                            &self.device,
+                            &self.vfio_ops,
+                            &self.device_path,
+                            self.bdf,
+                            region.index,
+                            area.offset,
+                        )?;
                     }
                     region.user_memory_regions.push(user_memory_region);
                 }
             }
         }
 
+        self.p2p_dma_mapped = self.p2p_dma;
+
         Ok(())
+    }
+
+    #[cfg(feature = "kvm")]
+    fn is_memory_space_enabled(&mut self) -> bool {
+        self.common.read_config_register(COMMAND_REG) & COMMAND_REG_MEMORY_SPACE_MASK
+            == COMMAND_REG_MEMORY_SPACE_MASK
+    }
+
+    /// Based on memory space enable bit, map or unmap DMA buffers
+    #[cfg(feature = "kvm")]
+    fn update_dma_buffers(&mut self, last_memory_space_enabled: bool) {
+        // The need for comparing the current memory space enable bit value
+        // with the previous one comes from the fact a write in the middle
+        // might have updated the value.
+        // If the value didn't change, the mappings don't need to change.
+        let memory_space_enabled = self.is_memory_space_enabled();
+        if !self.p2p_dma || memory_space_enabled == last_memory_space_enabled {
+            return;
+        }
+
+        let Some(vfio_iommufd) = self.vfio_ops.as_any().downcast_ref::<VfioIommufd>() else {
+            return;
+        };
+        let (failed_action, success_action) = if memory_space_enabled {
+            ("map", "Mapped")
+        } else {
+            ("unmap", "Unmapped")
+        };
+
+        for mmio_region in self.common.mmio_regions.iter() {
+            for user_memory_region in mmio_region.user_memory_regions.iter() {
+                let Some(dma_buf) = &user_memory_region.dma_buf else {
+                    continue;
+                };
+                let iova = user_memory_region.start;
+                let length = user_memory_region.mapping.len() as u64;
+
+                let res = if memory_space_enabled {
+                    vfio_iommufd
+                        .ioas()
+                        .map_file(dma_buf.as_raw_fd(), 0, length, iova, true)
+                } else {
+                    vfio_iommufd.ioas().unmap(iova, length)
+                };
+
+                match res {
+                    Ok(()) => debug!(
+                        "{success_action} region {} of device {} at 0x{iova:x} \
+                         through its dma-buf",
+                        mmio_region.index, self.bdf
+                    ),
+                    Err(e) => error!(
+                        "Could not {failed_action} region {} of device {} at 0x{iova:x}: {e}",
+                        mmio_region.index, self.bdf
+                    ),
+                }
+            }
+        }
+
+        self.p2p_dma_mapped = memory_space_enabled;
     }
 
     pub fn unmap_mmio_regions(&mut self) {
@@ -2404,7 +2601,7 @@ impl VfioPciDevice {
                 let host_addr = user_memory_region.mapping.addr();
                 // Unmap MMIO region from the host IOMMU address space via VfioOps
                 // Only needed if p2p_dma is enabled.
-                if self.p2p_dma
+                if self.p2p_dma_mapped
                     && let Err(e) = self
                         .vfio_ops
                         .vfio_dma_unmap(user_memory_region.start, len)
@@ -2437,6 +2634,8 @@ impl VfioPciDevice {
                     .free_memory_slot(user_memory_region.slot);
             }
         }
+
+        self.p2p_dma_mapped = false;
     }
 
     pub fn mmio_regions(&self) -> Vec<MmioRegion> {
@@ -2551,7 +2750,17 @@ impl PciDevice for VfioPciDevice {
         offset: u64,
         data: &[u8],
     ) -> (Vec<BarReprogrammingParams>, Option<Arc<Barrier>>) {
-        self.common.write_config_register(reg_idx, offset, data)
+        #[cfg(feature = "kvm")]
+        let memory_space_enabled = reg_idx == COMMAND_REG && self.is_memory_space_enabled();
+
+        let ret = self.common.write_config_register(reg_idx, offset, data);
+
+        #[cfg(feature = "kvm")]
+        if reg_idx == COMMAND_REG {
+            self.update_dma_buffers(memory_space_enabled);
+        }
+
+        ret
     }
 
     fn read_config_register(&mut self, reg_idx: usize) -> u32 {
@@ -2569,15 +2778,18 @@ impl PciDevice for VfioPciDevice {
     fn move_bar(&mut self, bar_idx: usize, new_base: u64) -> Result<(), io::Error> {
         for region in self.common.mmio_regions.iter_mut() {
             if region.index as usize == bar_idx {
+                let region_index = region.index;
                 let old_base = region.start.raw_value();
+                let map_p2p = self.p2p_dma_mapped && region.is_p2p_mappable();
                 region.start = GuestAddress(new_base);
 
                 for user_memory_region in region.user_memory_regions.iter_mut() {
                     let len = user_memory_region.mapping.len();
                     let host_addr = user_memory_region.mapping.addr();
+                    let offset = user_memory_region.start - old_base;
                     // Unmap the old MMIO region from the host IOMMU address space via VfioOps
                     // Only needed if p2p_dma is enabled.
-                    if self.p2p_dma
+                    if map_p2p
                         && let Err(e) = self
                             .vfio_ops
                             .vfio_dma_unmap(user_memory_region.start, len)
@@ -2632,23 +2844,23 @@ iova 0x{:x}, size 0x{:x}: {}, ",
 
                     // Map the moved MMIO region into the host IOMMU address space via VfioOps
                     // Only needed if p2p_dma is enabled.
-                    if self.p2p_dma {
-                        // vfio_dma_map is unsound and ought to be marked as unsafe
-                        // SAFETY: MmapRegion invariants guarantee that
-                        // host_addr points to len bytes of
-                        // valid memory that will only be unmapped with munmap().
-                        unsafe {
-                            self.vfio_ops
-                                .vfio_dma_map(user_memory_region.start, len, host_addr)
-                        }
-                        .map_err(|e| VfioPciError::DmaMap(e, self.device_path.clone(), self.bdf))
-                        .map_err(|e| {
-                            io::Error::other(format!(
-                                "Could not map MMIO region into the host IOMMU address space: \
+                    if map_p2p {
+                        user_memory_region
+                            .map_for_p2p(
+                                &self.device,
+                                &self.vfio_ops,
+                                &self.device_path,
+                                self.bdf,
+                                region_index,
+                                offset,
+                            )
+                            .map_err(|e| {
+                                io::Error::other(format!(
+                                    "Could not map MMIO region into the host IOMMU address space: \
 iova 0x{:x}, size 0x{:x}: {}, ",
-                                user_memory_region.start, len, e
-                            ))
-                        })?;
+                                    user_memory_region.start, len, e
+                                ))
+                            })?;
                     }
                 }
             }
@@ -2884,11 +3096,15 @@ mod tests {
                     slot: 0,
                     start: page_size,
                     mapping: mapping_a,
+                    #[cfg(feature = "kvm")]
+                    dma_buf: None,
                 },
                 UserMemoryRegion {
                     slot: 1,
                     start: 3 * page_size,
                     mapping: mapping_b,
+                    #[cfg(feature = "kvm")]
+                    dma_buf: None,
                 },
             ],
         }]
@@ -3127,9 +3343,6 @@ mod tests {
         type GroupConfig = MsiIrqGroupConfig;
         fn create_group(&self, _: MsiIrqGroupConfig) -> io::Result<Arc<dyn InterruptSourceGroup>> {
             unimplemented!("not exercised by the migration-helper tests")
-        }
-        fn destroy_group(&self, _: Arc<dyn InterruptSourceGroup>) -> io::Result<()> {
-            Ok(())
         }
     }
 
@@ -3530,6 +3743,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn msix_capability_without_msix_interrupts_is_read_from_device() {
+        // The device exposes an MSI-X capability, but MSI-X is not set up
+        // because the device reports no MSI-X interrupts.
+        let mock = MockConfigSpace::new(&[]);
+        mock.region_write(
+            VFIO_PCI_CONFIG_REGION_INDEX,
+            PCI_CONFIG_STATUS_OFFSET.into(),
+            &PCI_CONFIG_STATUS_CAPABILITIES_LIST.to_le_bytes(),
+        );
+        // Place the capability at 0x40, the first offset after the
+        // 64-byte standard config header.
+        mock.region_write(
+            VFIO_PCI_CONFIG_REGION_INDEX,
+            PCI_CONFIG_CAPABILITY_OFFSET.into(),
+            &[0x40],
+        );
+        // Capability ID, next pointer 0 (end of list), message control 0,
+        // then the Table Offset/BIR dword with an arbitrary marker 0xab.
+        mock.region_write(
+            VFIO_PCI_CONFIG_REGION_INDEX,
+            0x40,
+            &[PciCapabilityId::MsiX as u8, 0, 0, 0, 0xab, 0, 0, 0],
+        );
+        let mut common = test_vfio_common(mock, None);
+
+        // Register index of the Table Offset/BIR dword at 0x40 + 4. With
+        // MSI-X set up, this read would return the emulated table value
+        // instead of the device's.
+        assert_eq!(common.read_config_register(0x44 / 4), 0xab);
+    }
+
     fn test_vfio_common_with_pasid(vfio_wrapper: Arc<MockConfigSpace>) -> VfioCommon {
         let mut common = test_vfio_common(vfio_wrapper, None);
         common.extended_caps = vec![Arc::new(PasidCap::new(16, false, false))];
@@ -3631,15 +3876,22 @@ mod tests {
         let mut common = test_vfio_common(Arc::clone(&mock), None);
 
         // A patch covering a few fields leaves the rest of the register to the
-        // device, so the write must still reach it.
-        common.patch_reg(0x40 / 4, 0x0000_ffff, 0x1234, 0);
+        // device, so the write reaches it where the write mask allows it.
+        common.patch_reg(0x40 / 4, 0x0000_ffff, 0x1234, 0x0000_ffff);
         common.write_config_register(0x40 / 4, 0, &0xabcd_5678u32.to_le_bytes());
-        assert_eq!(mock.dword(0x40), 0xabcd_5678);
+        assert_eq!(mock.dword(0x40), 0xabcd_0000);
         assert_eq!(common.read_config_register(0x40 / 4), 0xabcd_1234);
+
+        // Without the write mask the device is left alone, so a patched
+        // field answers reads while the rest stays read only.
+        common.patch_reg(0x60 / 4, 0x0000_ffff, 0x1234, 0xffff_ffff);
+        common.write_config_register(0x60 / 4, 0, &0xabcd_5678u32.to_le_bytes());
+        assert_eq!(mock.dword(0x60), 0);
+        assert_eq!(common.read_config_register(0x60 / 4), 0x0000_1234);
 
         // A patch covering the whole register describes a register the device
         // doesn't have, so the write only updates the writable fields.
-        common.patch_reg(0x50 / 4, 0xffff_ffff, 0x0000_0001, 0x0000_00ff);
+        common.patch_reg(0x50 / 4, 0xffff_ffff, 0x0000_0001, 0xffff_ff00);
         common.write_config_register(0x50 / 4, 0, &0x1111_2222u32.to_le_bytes());
         assert_eq!(mock.dword(0x50), 0);
         assert_eq!(common.read_config_register(0x50 / 4), 0x0000_0022);
@@ -3649,7 +3901,7 @@ mod tests {
     fn patches_are_restored_from_a_snapshot() {
         let mock = MockConfigSpace::new(&[]);
         let mut common = test_vfio_common(Arc::clone(&mock), None);
-        common.patch_reg(0x40 / 4, 0x0000_ffff, 0x1234, 0);
+        common.patch_reg(0x40 / 4, 0x0000_ffff, 0x1234, 0xffff_ffff);
 
         let snapshot = Snapshot::new_from_state(&common.state()).unwrap();
         let state: VfioCommonState = snapshot.to_state().unwrap();

@@ -56,8 +56,6 @@ use igvm::IgvmFile;
 #[cfg(feature = "sev_snp")]
 use igvm_defs::SnpPolicy;
 use libc::{SIGWINCH, termios};
-#[cfg(feature = "tdx")]
-use linux_loader::bootparam;
 use linux_loader::cmdline::Cmdline;
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use linux_loader::elf;
@@ -75,10 +73,6 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracer::trace_scoped;
 use vm_device::Bus;
-#[cfg(feature = "tdx")]
-use vm_memory::GuestMemoryBackend;
-#[cfg(feature = "tdx")]
-use vm_memory::{Address, ByteValued, GuestMemoryRegion, ReadVolatile};
 use vm_memory::{Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic};
 use vm_migration::protocol::{MemoryRangeTable, Request, Response};
 use vm_migration::{
@@ -100,8 +94,6 @@ use crate::gdb::{Debuggable, DebuggableError, GdbRequestPayload, GdbResponsePayl
 #[cfg(feature = "igvm")]
 use crate::igvm::{igvm_loader, parse_igvm};
 use crate::landlock::LandlockError;
-#[cfg(feature = "tdx")]
-use crate::memory_manager;
 use crate::memory_manager::{
     Error as MemoryManagerError, MemoryManager, MemoryManagerSnapshotData, MemoryRangePolicy,
 };
@@ -170,6 +162,9 @@ pub enum Error {
 
     #[error("Error initializing VM")]
     InitializeVm(#[source] hypervisor::HypervisorVmError),
+
+    #[error("Error creating VM")]
+    CreateVm(#[source] hypervisor::HypervisorError),
 
     #[error("No device with id {0:?} to remove")]
     NoDeviceToRemove(String),
@@ -267,46 +262,6 @@ pub enum Error {
     #[cfg(feature = "sev_snp")]
     #[error("Error enabling SEV-SNP VM")]
     InitializeSevSnpVm(#[source] hypervisor::HypervisorVmError),
-
-    #[cfg(feature = "tdx")]
-    #[error("Error performing I/O on TDX firmware file")]
-    LoadTdvf(#[source] io::Error),
-
-    #[cfg(feature = "tdx")]
-    #[error("Error performing I/O on the TDX payload file")]
-    LoadPayload(#[source] io::Error),
-
-    #[cfg(feature = "tdx")]
-    #[error("Error parsing TDVF")]
-    ParseTdvf(#[source] arch::x86_64::tdx::TdvfError),
-
-    #[cfg(feature = "tdx")]
-    #[error("Error populating TDX HOB")]
-    PopulateHob(#[source] arch::x86_64::tdx::TdvfError),
-
-    #[cfg(feature = "tdx")]
-    #[error("Error allocating TDVF memory")]
-    AllocatingTdvfMemory(#[source] memory_manager::Error),
-
-    #[cfg(feature = "tdx")]
-    #[error("Error enabling TDX VM")]
-    InitializeTdxVm(#[source] hypervisor::HypervisorVmError),
-
-    #[cfg(feature = "tdx")]
-    #[error("Error enabling TDX memory region")]
-    InitializeTdxMemoryRegion(#[source] hypervisor::HypervisorVmError),
-
-    #[cfg(feature = "tdx")]
-    #[error("Error finalizing TDX VM")]
-    FinalizeTdx(#[source] hypervisor::HypervisorVmError),
-
-    #[cfg(feature = "tdx")]
-    #[error("TDX firmware missing")]
-    TdxFirmwareMissing,
-
-    #[cfg(feature = "tdx")]
-    #[error("Invalid TDX payload type")]
-    InvalidPayloadType,
 
     #[cfg(feature = "guest_debug")]
     #[error("Error debugging VM")]
@@ -430,28 +385,27 @@ impl VmOps for VmOpsHandler {
         self.memory
             .memory()
             .write(buf, GuestAddress(gpa))
-            .map_err(|e| HypervisorVmError::GuestMemWrite(e.into()))
+            .map_err(HypervisorVmError::GuestMemWrite)
     }
 
     fn guest_mem_read(&self, gpa: u64, buf: &mut [u8]) -> result::Result<usize, HypervisorVmError> {
         self.memory
             .memory()
             .read(buf, GuestAddress(gpa))
-            .map_err(|e| HypervisorVmError::GuestMemRead(e.into()))
+            .map_err(HypervisorVmError::GuestMemRead)
     }
 
     fn mmio_read(&self, gpa: u64, data: &mut [u8]) -> result::Result<(), HypervisorVmError> {
-        if let Err(vm_device::BusError::MissingAddressRange) = self.mmio_bus.read(gpa, data) {
-            debug!("Guest MMIO read from unregistered address 0x{gpa:x}");
-            data.fill(0xff); // 0xff is sentinel value for invalid reads
+        if let Err(error) = self.mmio_bus.read(gpa, data) {
+            debug!("Guest MMIO read failed: {error}");
         }
         Ok(())
     }
 
     fn mmio_write(&self, gpa: u64, data: &[u8]) -> result::Result<(), HypervisorVmError> {
         match self.mmio_bus.write(gpa, data) {
-            Err(vm_device::BusError::MissingAddressRange) => {
-                debug!("Guest MMIO write to unregistered address 0x{gpa:x}");
+            Err(error) => {
+                debug!("Guest MMIO write failed: {error}");
             }
             Ok(Some(barrier)) => {
                 info!("Waiting for barrier");
@@ -465,9 +419,8 @@ impl VmOps for VmOpsHandler {
 
     #[cfg(target_arch = "x86_64")]
     fn pio_read(&self, port: u64, data: &mut [u8]) -> result::Result<(), HypervisorVmError> {
-        if let Err(vm_device::BusError::MissingAddressRange) = self.io_bus.read(port, data) {
-            debug!("Guest PIO read from unregistered address 0x{port:x}");
-            data.fill(0xff); // 0xff is sentinel value for invalid reads
+        if let Err(error) = self.io_bus.read(port, data) {
+            debug!("Guest PIO read failed: {error}");
         }
         Ok(())
     }
@@ -475,8 +428,8 @@ impl VmOps for VmOpsHandler {
     #[cfg(target_arch = "x86_64")]
     fn pio_write(&self, port: u64, data: &[u8]) -> result::Result<(), HypervisorVmError> {
         match self.io_bus.write(port, data) {
-            Err(vm_device::BusError::MissingAddressRange) => {
-                debug!("Guest PIO write to unregistered address 0x{port:x}");
+            Err(error) => {
+                debug!("Guest PIO write failed: {error}");
             }
             Ok(Some(barrier)) => {
                 info!("Waiting for barrier");
@@ -538,8 +491,6 @@ struct SavedClock {
 }
 
 pub struct Vm {
-    #[cfg(feature = "tdx")]
-    kernel: Option<File>,
     initramfs: Option<File>,
     threads: Vec<thread::JoinHandle<()>>,
     device_manager: Arc<Mutex<DeviceManager>>,
@@ -601,13 +552,21 @@ impl Vm {
             .validate()
             .map_err(Error::ConfigValidation)?;
 
+        #[cfg(all(feature = "kvm", feature = "mshv", feature = "sev_snp"))]
+        if hypervisor.hypervisor_type() == hypervisor::HypervisorType::Mshv {
+            let config = config.lock().unwrap();
+            if config.is_sev_snp_enabled() && config.cpus.max_vcpus != config.cpus.boot_vcpus {
+                return Err(Error::ConfigValidation(ValidationError::SevSnpNoCpuHotplug));
+            }
+        }
+
         info!("Booting VM from config: {config:?}");
 
         // Create NUMA nodes based on NumaConfig.
         let numa_nodes =
             Self::create_numa_nodes(config.lock().unwrap().numa.as_deref(), &memory_manager)?;
 
-        // Determine if VIRTIO_F_ACCESS_PLATFORM should be forced (e.g. for TDX/SEV-SNP)
+        // Determine if VIRTIO_F_ACCESS_PLATFORM should be forced (e.g. for SEV-SNP)
         let force_access_platform = Self::should_force_access_platform(&config);
 
         let stop_on_boot = Self::should_stop_on_boot(&config);
@@ -637,10 +596,6 @@ impl Vm {
             vm_ops,
             &numa_nodes,
         )?;
-
-        // Perform hypervisor-specific TDX initialization if enabled
-        #[cfg(feature = "tdx")]
-        Self::init_tdx_if_enabled(&config, &vm, &cpu_manager)?;
 
         // Create device manager
         let device_manager = Self::create_device_manager(
@@ -679,18 +634,6 @@ impl Vm {
             igvm_file,
         )?;
 
-        // Load files needed directly by the VMM.
-        #[cfg(feature = "tdx")]
-        let kernel = config
-            .lock()
-            .unwrap()
-            .payload
-            .as_ref()
-            .map(|p| p.kernel.as_ref().map(File::open))
-            .unwrap_or_default()
-            .transpose()
-            .map_err(Error::KernelFile)?;
-
         let initramfs = config
             .lock()
             .unwrap()
@@ -720,8 +663,6 @@ impl Vm {
         };
 
         Ok(Vm {
-            #[cfg(feature = "tdx")]
-            kernel,
             initramfs,
             device_manager,
             config,
@@ -741,13 +682,9 @@ impl Vm {
     /// Determine if VIRTIO_F_ACCESS_PLATFORM should be forced based on
     /// confidential computing features.
     fn should_force_access_platform(_config: &Arc<Mutex<VmConfig>>) -> bool {
-        #[cfg(any(feature = "tdx", feature = "sev_snp"))]
+        #[cfg(feature = "sev_snp")]
         {
             let config = _config.lock().unwrap();
-            #[cfg(feature = "tdx")]
-            if config.is_tdx_enabled() {
-                return true;
-            }
             #[cfg(feature = "sev_snp")]
             if config.is_sev_snp_enabled() {
                 return true;
@@ -783,8 +720,6 @@ impl Vm {
         vm_ops: Arc<dyn VmOps>,
         numa_nodes: &NumaNodes,
     ) -> Result<Arc<Mutex<cpu::CpuManager>>> {
-        #[cfg(feature = "tdx")]
-        let tdx_enabled = config.lock().unwrap().is_tdx_enabled();
         #[cfg(feature = "sev_snp")]
         let sev_snp_enabled = config.lock().unwrap().is_sev_snp_enabled();
         #[cfg(feature = "igvm")]
@@ -808,8 +743,6 @@ impl Vm {
             Arc::clone(hypervisor),
             seccomp_action,
             vm_ops,
-            #[cfg(feature = "tdx")]
-            tdx_enabled,
             numa_nodes,
             #[cfg(feature = "sev_snp")]
             sev_snp_enabled,
@@ -818,22 +751,6 @@ impl Vm {
         )
         .map_err(Error::CpuManager)?;
         Ok(cpu_manager)
-    }
-
-    /// Initialize TDX if enabled.
-    #[cfg(feature = "tdx")]
-    fn init_tdx_if_enabled(
-        config: &Arc<Mutex<VmConfig>>,
-        vm: &Arc<dyn hypervisor::Vm>,
-        cpu_manager: &Arc<Mutex<cpu::CpuManager>>,
-    ) -> Result<()> {
-        if config.lock().unwrap().is_tdx_enabled() {
-            let cpuid = cpu_manager.lock().unwrap().common_cpuid();
-            let max_vcpus = cpu_manager.lock().unwrap().max_vcpus();
-            vm.tdx_init(&cpuid, max_vcpus)
-                .map_err(Error::InitializeTdxVm)?;
-        }
-        Ok(())
     }
 
     /// Create and configure the device manager.
@@ -856,9 +773,6 @@ impl Vm {
         #[cfg(not(target_arch = "riscv64"))] timestamp: Instant,
         snapshot: Option<&Snapshot>,
     ) -> Result<Arc<Mutex<DeviceManager>>> {
-        #[cfg(feature = "tdx")]
-        let dynamic = !config.lock().unwrap().is_tdx_enabled();
-        #[cfg(not(feature = "tdx"))]
         let dynamic = true;
 
         DeviceManager::new(
@@ -1017,7 +931,8 @@ impl Vm {
         snapshot: Option<&Snapshot>,
         igvm_file: Option<IgvmFile>,
     ) -> Result<Option<thread::JoinHandle<Result<EntryPoint>>>> {
-        // Create boot vCPUs before SEV-SNP initialization
+        // Create vCPUs before SEV-SNP initialization, including reserved
+        // hotplug vCPUs on KVM. Only boot_vcpus are started at boot.
         cpu_manager
             .lock()
             .unwrap()
@@ -1169,12 +1084,9 @@ impl Vm {
         fw_cfg_config: &FwCfgConfig,
         device_manager: &Arc<Mutex<DeviceManager>>,
         config: &Arc<Mutex<VmConfig>>,
+        #[cfg(target_arch = "x86_64")] boot_memory: &GuestMemoryMmap,
         #[cfg(target_arch = "x86_64")] kvm_sev_snp_enabled: bool,
     ) -> Result<()> {
-        let mut e820_option: Option<usize> = None;
-        if fw_cfg_config.e820 {
-            e820_option = Some(config.lock().unwrap().memory.size as usize);
-        }
         let mut kernel_option: Option<File> = None;
         if fw_cfg_config.kernel {
             let kernel = config
@@ -1239,16 +1151,22 @@ impl Vm {
             fw_cfg_item_list_option = Some(fw_cfg_item_list);
         }
 
-        let device_manager_binding = device_manager.lock().unwrap();
-        let Some(fw_cfg) = device_manager_binding.fw_cfg() else {
-            return Err(Error::FwCfgDisabled);
-        };
-
-        fw_cfg
+        let fw_cfg = device_manager
             .lock()
             .unwrap()
+            .fw_cfg()
+            .cloned()
+            .ok_or(Error::FwCfgDisabled)?;
+
+        let mut fw_cfg = fw_cfg.lock().unwrap();
+        #[cfg(target_arch = "x86_64")]
+        if fw_cfg_config.e820 {
+            fw_cfg
+                .add_e820(boot_memory, kvm_sev_snp_enabled)
+                .map_err(Error::ErrorPopulatingFwCfg)?;
+        }
+        fw_cfg
             .populate_fw_cfg(
-                e820_option,
                 kernel_option,
                 initramfs_option,
                 cmdline_option,
@@ -1358,13 +1276,6 @@ impl Vm {
         #[cfg(not(target_arch = "riscv64"))]
         let timestamp = Instant::now();
 
-        #[cfg(feature = "tdx")]
-        let tdx_enabled = if snapshot.is_some() {
-            false
-        } else {
-            vm_config.lock().unwrap().is_tdx_enabled()
-        };
-
         #[cfg(feature = "igvm")]
         let igvm_file = {
             let config = vm_config.lock().unwrap();
@@ -1410,25 +1321,29 @@ impl Vm {
 
         let memory_manager =
             if let Some(snapshot) = snapshot_from_id(snapshot, MEMORY_MANAGER_SNAPSHOT_ID) {
+                let vm_config = vm_config.lock().unwrap();
                 MemoryManager::new_from_snapshot(
                     snapshot,
                     Arc::clone(&vm),
-                    &vm_config.lock().unwrap().memory.clone(),
+                    &vm_config.memory.clone(),
                     source_url,
                     prefault.unwrap_or(false),
                     memory_restore_mode,
                     phys_bits,
                     &exit_evt,
+                    #[cfg(feature = "sev_snp")]
+                    vm_config.is_sev_snp_enabled(),
                 )
                 .map_err(Error::MemoryManager)?
             } else {
+                let vm_config = vm_config.lock().unwrap();
                 MemoryManager::new(
                     Arc::clone(&vm),
-                    &vm_config.lock().unwrap().memory.clone(),
+                    &vm_config.memory.clone(),
                     None,
                     phys_bits,
-                    #[cfg(feature = "tdx")]
-                    tdx_enabled,
+                    #[cfg(feature = "sev_snp")]
+                    vm_config.is_sev_snp_enabled(),
                     None,
                     Default::default(),
                 )
@@ -1462,16 +1377,19 @@ impl Vm {
         hypervisor: &dyn hypervisor::Hypervisor,
         config: HypervisorVmConfig,
     ) -> Result<Arc<dyn hypervisor::Vm>> {
-        hypervisor.check_required_extensions().unwrap();
+        hypervisor
+            .check_required_extensions()
+            .map_err(Error::CreateVm)?;
 
-        let vm = hypervisor.create_vm(config).unwrap();
+        let vm = hypervisor.create_vm(config).map_err(Error::CreateVm)?;
 
         #[cfg(target_arch = "x86_64")]
         {
             vm.set_identity_map_address(KVM_IDENTITY_MAP_START.0)
-                .unwrap();
-            vm.set_tss_address(KVM_TSS_START.0 as usize).unwrap();
-            vm.enable_split_irq().unwrap();
+                .map_err(Error::InitializeVm)?;
+            vm.set_tss_address(KVM_TSS_START.0 as usize)
+                .map_err(Error::InitializeVm)?;
+            vm.enable_split_irq().map_err(Error::InitializeVm)?;
         }
 
         Ok(vm)
@@ -1786,12 +1704,6 @@ impl Vm {
         #[cfg(feature = "igvm")] cpu_manager: &Arc<Mutex<cpu::CpuManager>>,
         #[cfg(feature = "igvm")] igvm_file: Option<IgvmFile>,
     ) -> Result<Option<thread::JoinHandle<Result<EntryPoint>>>> {
-        // Kernel with TDX is loaded in a different manner
-        #[cfg(feature = "tdx")]
-        if config.lock().unwrap().is_tdx_enabled() {
-            return Ok(None);
-        }
-
         config
             .lock()
             .unwrap()
@@ -1942,6 +1854,8 @@ impl Vm {
             .as_ref()
             .and_then(|p| p.smbios_config());
 
+        let nested = self.cpu_manager.lock().unwrap().nested();
+
         arch::configure_system(
             &mem,
             cmdline.as_cstring().unwrap().to_str().unwrap(),
@@ -1954,6 +1868,7 @@ impl Vm {
             &vgic,
             &self.numa_nodes,
             pmu_supported,
+            nested,
             smbios.as_ref(),
             rsdp_addr.filter(|_| entry_addr.entry_addr != layout::UEFI_START),
         )
@@ -2048,13 +1963,6 @@ impl Vm {
 
         self.state.valid_transition(new_state)?;
 
-        // Wake up the DeviceManager threads so they will get terminated cleanly
-        self.device_manager
-            .lock()
-            .unwrap()
-            .resume()
-            .map_err(Error::Resume)?;
-
         self.cpu_manager
             .lock()
             .unwrap()
@@ -2103,7 +2011,10 @@ impl Vm {
                 .resize(desired_memory)
                 .map_err(Error::MemoryManager)?;
 
-            let memory_config = &mut self.config.lock().unwrap().memory;
+            // The config lock must not be held while taking the device
+            // manager lock: a vCPU ejecting a device takes them in the
+            // opposite order.
+            let hotplug_method = self.config.lock().unwrap().memory.hotplug_method;
 
             if let Some(new_region) = &new_region {
                 self.device_manager
@@ -2112,7 +2023,7 @@ impl Vm {
                     .update_memory(new_region)
                     .map_err(Error::DeviceManager)?;
 
-                match memory_config.hotplug_method {
+                match hotplug_method {
                     HotplugMethod::Acpi => {
                         self.device_manager
                             .lock()
@@ -2123,6 +2034,8 @@ impl Vm {
                     HotplugMethod::VirtioMem => {}
                 }
             }
+
+            let memory_config = &mut self.config.lock().unwrap().memory;
 
             // We update the VM config regardless of the actual guest resize
             // operation result (happened or not), so that if the VM reboots
@@ -2449,317 +2362,10 @@ impl Vm {
         Ok(self.device_manager.lock().unwrap().counters())
     }
 
-    #[cfg(feature = "tdx")]
-    fn extract_tdvf_sections(&mut self) -> Result<(Vec<arch::x86_64::tdx::TdvfSection>, bool)> {
-        use arch::x86_64::tdx::*;
-
-        let firmware_path = self
-            .config
-            .lock()
-            .unwrap()
-            .payload
-            .as_ref()
-            .unwrap()
-            .firmware
-            .clone()
-            .ok_or(Error::TdxFirmwareMissing)?;
-        // The TDVF file contains a table of section as well as code
-        let mut firmware_file = File::open(firmware_path).map_err(Error::LoadTdvf)?;
-
-        // For all the sections allocate some RAM backing them
-        parse_tdvf_sections(&mut firmware_file).map_err(Error::ParseTdvf)
-    }
-
-    #[cfg(feature = "tdx")]
-    fn hob_memory_resources(
-        mut sorted_sections: Vec<arch::x86_64::tdx::TdvfSection>,
-        guest_memory: &GuestMemoryMmap,
-    ) -> Vec<(u64, u64, bool)> {
-        let mut list = Vec::new();
-
-        let mut current_section = sorted_sections.pop();
-
-        // RAM regions interleaved with TDVF sections
-        let mut next_start_addr = 0;
-        for region in guest_memory.iter() {
-            let region_start = region.start_addr().0;
-            let region_end = region.last_addr().0;
-            if region_start > next_start_addr {
-                next_start_addr = region_start;
-            }
-
-            loop {
-                let (start, size, ram) = if let Some(section) = &current_section {
-                    if section.address <= next_start_addr {
-                        (section.address, section.size, false)
-                    } else {
-                        let last_addr = cmp::min(section.address - 1, region_end);
-                        (next_start_addr, last_addr - next_start_addr + 1, true)
-                    }
-                } else {
-                    (next_start_addr, region_end - next_start_addr + 1, true)
-                };
-
-                list.push((start, size, ram));
-
-                if !ram {
-                    current_section = sorted_sections.pop();
-                }
-
-                next_start_addr = start + size;
-
-                if region_start > next_start_addr {
-                    next_start_addr = region_start;
-                }
-
-                if next_start_addr > region_end {
-                    break;
-                }
-            }
-        }
-
-        // Once all the interleaved sections have been processed, let's simply
-        // pull the remaining ones.
-        if let Some(section) = current_section {
-            list.push((section.address, section.size, false));
-        }
-        while let Some(section) = sorted_sections.pop() {
-            list.push((section.address, section.size, false));
-        }
-
-        list
-    }
-
-    #[cfg(feature = "tdx")]
-    fn populate_tdx_sections(
-        &mut self,
-        sections: &[arch::x86_64::tdx::TdvfSection],
-        guid_found: bool,
-    ) -> Result<Option<u64>> {
-        use arch::x86_64::tdx::*;
-        // Get the memory end *before* we start adding TDVF ram regions
-        let boot_guest_memory = self
-            .memory_manager
-            .lock()
-            .as_ref()
-            .unwrap()
-            .boot_guest_memory();
-        for section in sections {
-            // No need to allocate if the section falls within guest RAM ranges
-            if boot_guest_memory.address_in_range(GuestAddress(section.address)) {
-                info!(
-                    "Not allocating TDVF Section: {section:x?} since it is already part of guest RAM"
-                );
-                continue;
-            }
-
-            info!("Allocating TDVF Section: {section:x?}");
-            self.memory_manager
-                .lock()
-                .unwrap()
-                .add_ram_region(GuestAddress(section.address), section.size as usize)
-                .map_err(Error::AllocatingTdvfMemory)?;
-        }
-
-        // The TDVF file contains a table of section as well as code
-        let firmware_path = self
-            .config
-            .lock()
-            .unwrap()
-            .payload
-            .as_ref()
-            .unwrap()
-            .firmware
-            .clone()
-            .ok_or(Error::TdxFirmwareMissing)?;
-        let mut firmware_file = File::open(firmware_path).map_err(Error::LoadTdvf)?;
-
-        // The guest memory at this point now has all the required regions so it
-        // is safe to copy from the TDVF file into it.
-        let guest_memory = self.memory_manager.lock().as_ref().unwrap().guest_memory();
-        let mem = guest_memory.memory();
-        let mut payload_info = None;
-        let mut hob_offset = None;
-        for section in sections {
-            info!("Populating TDVF Section: {section:x?}");
-            match section.r#type {
-                TdvfSectionType::Bfv | TdvfSectionType::Cfv => {
-                    info!("Copying section to guest memory");
-                    firmware_file
-                        .seek(SeekFrom::Start(section.data_offset as u64))
-                        .map_err(Error::LoadTdvf)?;
-                    // TODO although the name indicates, there is no retry internally: https://github.com/rust-vmm/rust-vmm/issues/43
-                    // For now, we prefer to fail loudly at least.
-                    mem.read_exact_volatile_from(
-                        GuestAddress(section.address),
-                        &mut firmware_file,
-                        section.data_size as usize,
-                    )
-                    .unwrap();
-                }
-                TdvfSectionType::TdHob => {
-                    hob_offset = Some(section.address);
-                }
-                TdvfSectionType::Payload => {
-                    info!("Copying payload to guest memory");
-                    if let Some(payload_file) = self.kernel.as_mut() {
-                        let payload_size = payload_file
-                            .seek(SeekFrom::End(0))
-                            .map_err(Error::LoadPayload)?;
-
-                        payload_file
-                            .seek(SeekFrom::Start(0x1f1))
-                            .map_err(Error::LoadPayload)?;
-
-                        let mut payload_header = bootparam::setup_header::default();
-                        payload_file
-                            .read_exact_volatile(&mut payload_header.as_bytes())
-                            .unwrap();
-
-                        if payload_header.header != 0x5372_6448 {
-                            return Err(Error::InvalidPayloadType);
-                        }
-
-                        if (payload_header.version < 0x0200)
-                            || ((payload_header.loadflags & 0x1) == 0x0)
-                        {
-                            return Err(Error::InvalidPayloadType);
-                        }
-
-                        payload_file.rewind().map_err(Error::LoadPayload)?;
-                        // TODO although the name indicates, there is no retry internally: https://github.com/rust-vmm/rust-vmm/issues/43
-                        // For now, we prefer to fail loudly at least.
-                        mem.read_exact_volatile_from(
-                            GuestAddress(section.address),
-                            payload_file,
-                            payload_size as usize,
-                        )
-                        .unwrap();
-
-                        // Create the payload info that will be inserted into
-                        // the HOB.
-                        payload_info = Some(PayloadInfo {
-                            image_type: PayloadImageType::BzImage,
-                            entry_point: section.address,
-                        });
-                    }
-                }
-                TdvfSectionType::PayloadParam => {
-                    info!("Copying payload parameters to guest memory");
-                    let cmdline = Self::generate_cmdline(
-                        self.config.lock().unwrap().payload.as_ref().unwrap(),
-                    )?;
-                    mem.write_slice(
-                        cmdline.as_cstring().unwrap().as_bytes_with_nul(),
-                        GuestAddress(section.address),
-                    )
-                    .unwrap();
-                }
-                _ => {}
-            }
-        }
-
-        // Generate HOB
-        let mut hob = TdHob::start(hob_offset.unwrap());
-
-        let mut sorted_sections = sections.to_vec();
-        sorted_sections.retain(|section| matches!(section.r#type, TdvfSectionType::TempMem));
-
-        sorted_sections.sort_by_key(|section| section.address);
-        sorted_sections.reverse();
-
-        for (start, size, ram) in Vm::hob_memory_resources(sorted_sections, &boot_guest_memory) {
-            hob.add_memory_resource(&mem, start, size, ram, guid_found)
-                .map_err(Error::PopulateHob)?;
-        }
-
-        // MMIO regions
-        hob.add_mmio_resource(
-            &mem,
-            layout::MEM_32BIT_DEVICES_START.raw_value(),
-            layout::APIC_START.raw_value() - layout::MEM_32BIT_DEVICES_START.raw_value(),
-        )
-        .map_err(Error::PopulateHob)?;
-        let start_of_device_area = self
-            .memory_manager
-            .lock()
-            .unwrap()
-            .start_of_device_area()
-            .raw_value();
-        let end_of_device_area = self
-            .memory_manager
-            .lock()
-            .unwrap()
-            .end_of_device_area()
-            .raw_value();
-        hob.add_mmio_resource(
-            &mem,
-            start_of_device_area,
-            end_of_device_area - start_of_device_area,
-        )
-        .map_err(Error::PopulateHob)?;
-
-        // Loop over the ACPI tables and copy them to the HOB.
-
-        for acpi_table in acpi::create_acpi_tables_tdx(
-            &self.device_manager.lock().unwrap(),
-            &self.cpu_manager.lock().unwrap(),
-            &self.memory_manager.lock().unwrap(),
-            &self.numa_nodes,
-        ) {
-            hob.add_acpi_table(&mem, acpi_table.as_slice())
-                .map_err(Error::PopulateHob)?;
-        }
-
-        // If a payload info has been created, let's insert it into the HOB.
-        if let Some(payload_info) = payload_info {
-            hob.add_payload(&mem, payload_info)
-                .map_err(Error::PopulateHob)?;
-        }
-
-        hob.finish(&mem).map_err(Error::PopulateHob)?;
-
-        Ok(hob_offset)
-    }
-
-    #[cfg(feature = "tdx")]
-    fn init_tdx_memory(&mut self, sections: &[arch::x86_64::tdx::TdvfSection]) -> Result<()> {
-        let guest_memory = self.memory_manager.lock().as_ref().unwrap().guest_memory();
-        let mem = guest_memory.memory();
-
-        for section in sections {
-            let size = section.size.try_into().unwrap();
-            // SAFETY: get_host_address_range does proper bounds checking
-            unsafe {
-                self.vm.tdx_init_memory_region(
-                    virtio_devices::get_host_address_range(
-                        &*mem,
-                        GuestAddress(section.address),
-                        size,
-                    )
-                    .unwrap(),
-                    section.address,
-                    size,
-                    /* TDVF_SECTION_ATTRIBUTES_EXTENDMR */
-                    section.attributes == 1,
-                )
-            }
-            .map_err(Error::InitializeTdxMemoryRegion)?;
-        }
-
-        Ok(())
-    }
-
     // Creates ACPI tables
-    // In case of TDX being used, this is a no-op since the tables will be
-    // created and passed when populating the HOB.
 
     #[cfg(not(target_arch = "riscv64"))]
     fn create_acpi_tables(&self) -> Result<Option<GuestAddress>> {
-        #[cfg(feature = "tdx")]
-        if self.config.lock().unwrap().is_tdx_enabled() {
-            return Ok(None);
-        }
         let mem = self.memory_manager.lock().unwrap().guest_memory().memory();
         let tpm_enabled = self.config.lock().unwrap().tpm.is_some();
         let rsdp_addr = acpi::create_acpi_tables(
@@ -2842,10 +2448,14 @@ impl Vm {
                     }
                 };
 
+                #[cfg(target_arch = "x86_64")]
+                let boot_memory = self.memory_manager.lock().unwrap().boot_guest_memory();
                 Self::populate_fw_cfg(
                     &fw_cfg_config,
                     &self.device_manager,
                     &self.config,
+                    #[cfg(target_arch = "x86_64")]
+                    &boot_memory,
                     #[cfg(target_arch = "x86_64")]
                     kvm_sev_snp_enabled,
                 )?;
@@ -2885,9 +2495,6 @@ impl Vm {
         // Load kernel synchronously or if asynchronous then wait for load to
         // finish.
         let entry_point = self.entry_point()?;
-
-        #[cfg(feature = "tdx")]
-        let tdx_enabled = self.config.lock().unwrap().is_tdx_enabled();
 
         #[cfg(target_arch = "aarch64")]
         let vgic = self
@@ -2930,22 +2537,6 @@ impl Vm {
                 .ok();
         }
 
-        #[cfg(feature = "tdx")]
-        let (sections, guid_found) = if tdx_enabled {
-            self.extract_tdvf_sections()?
-        } else {
-            (Vec::new(), false)
-        };
-
-        // Configuring the TDX regions requires that the vCPUs are created.
-        #[cfg(feature = "tdx")]
-        let hob_address = if tdx_enabled {
-            // TDX sections are written to memory.
-            self.populate_tdx_sections(&sections, guid_found)?
-        } else {
-            None
-        };
-
         // On aarch64 the ACPI tables depend on the vCPU mpidr which is only
         // available after they are configured
         #[cfg(target_arch = "aarch64")]
@@ -2962,23 +2553,6 @@ impl Vm {
 
         #[cfg(target_arch = "riscv64")]
         self.configure_system().unwrap();
-
-        #[cfg(feature = "tdx")]
-        if let Some(hob_address) = hob_address {
-            // With the HOB address extracted the vCPUs can have
-            // their TDX state configured.
-            self.cpu_manager
-                .lock()
-                .unwrap()
-                .initialize_tdx(hob_address)
-                .map_err(Error::CpuManager)?;
-            // Let the hypervisor know which memory ranges are shared with the
-            // guest. This prevents the guest from ignoring/discarding memory
-            // regions provided by the host.
-            self.init_tdx_memory(&sections)?;
-            // With TDX memory and CPU state configured TDX setup is complete
-            self.vm.tdx_finalize().map_err(Error::FinalizeTdx)?;
-        }
 
         // Resume the vm for MSHV
         if current_state == VmState::Created {
@@ -3004,6 +2578,14 @@ impl Vm {
             .unwrap()
             .try_lock_disks()
             .map_err(Error::LockingError)?;
+
+        // Any restore may be a fork, so reseed before the guest runs.
+        #[cfg(not(target_arch = "riscv64"))]
+        self.device_manager
+            .lock()
+            .unwrap()
+            .regenerate_vmgenid()
+            .map_err(Error::DeviceManager)?;
 
         // Now we can start all vCPUs from here.
         self.cpu_manager
@@ -3206,6 +2788,7 @@ impl Vm {
         let coredump_file_path = url_to_file(destination_url)?;
         let mapping_num = self.memory_manager.lock().unwrap().num_guest_ram_mappings();
 
+        #[expect(clippy::panic, reason = "coredump mapping count limit")]
         if mapping_num < UINT16_MAX - 2 {
             elf_phdr_num += mapping_num as u16;
         } else {
@@ -3282,6 +2865,10 @@ impl Vm {
             .restore_clock(&hv_vcpus, &saved.state, saved.mode)
             .context("Could not restore guest clock")
             .map_err(MigratableError::Resume)
+    }
+
+    pub fn cpu_manager(&self) -> &Arc<Mutex<cpu::CpuManager>> {
+        &self.cpu_manager
     }
 
     pub fn device_manager(&self) -> &Arc<Mutex<DeviceManager>> {
@@ -3367,13 +2954,11 @@ impl Snapshottable for Vm {
     fn snapshot(&mut self) -> result::Result<Snapshot, MigratableError> {
         event!("vm", "snapshotting");
 
-        #[cfg(feature = "tdx")]
-        {
-            if self.config.lock().unwrap().is_tdx_enabled() {
-                return Err(MigratableError::Snapshot(anyhow!(
-                    "Snapshot not possible with TDX VM"
-                )));
-            }
+        #[cfg(target_arch = "aarch64")]
+        if self.cpu_manager.lock().unwrap().nested() {
+            return Err(MigratableError::Snapshot(anyhow!(
+                "Snapshot not supported with aarch64 nested virtualization"
+            )));
         }
 
         if self.get_state() != VmState::Paused {
@@ -3623,17 +3208,6 @@ impl GuestDebuggable for Vm {
 
         let mut resume = false;
 
-        #[cfg(feature = "tdx")]
-        {
-            if let Some(ref platform) = self.config.lock().unwrap().platform
-                && platform.tdx
-            {
-                return Err(GuestDebuggableError::Coredump(anyhow!(
-                    "Coredump not possible with TDX VM"
-                )));
-            }
-        }
-
         match self.get_state() {
             VmState::Running => {
                 self.pause().map_err(GuestDebuggableError::Pause)?;
@@ -3743,211 +3317,6 @@ mod tests {
     #[test]
     fn test_vm_paused_transitions() {
         test_vm_state_transitions(VmState::Paused);
-    }
-
-    #[cfg(feature = "tdx")]
-    #[test]
-    fn test_hob_memory_resources() {
-        // Case 1: Two TDVF sections in the middle of the RAM
-        let sections = vec![
-            arch::x86_64::tdx::TdvfSection {
-                address: 0xc000,
-                size: 0x1000,
-                ..Default::default()
-            },
-            arch::x86_64::tdx::TdvfSection {
-                address: 0x1000,
-                size: 0x4000,
-                ..Default::default()
-            },
-        ];
-        let guest_ranges: Vec<(GuestAddress, usize)> = vec![(GuestAddress(0), 0x1000_0000)];
-        let expected = vec![
-            (0, 0x1000, true),
-            (0x1000, 0x4000, false),
-            (0x5000, 0x7000, true),
-            (0xc000, 0x1000, false),
-            (0xd000, 0x0fff_3000, true),
-        ];
-        assert_eq!(
-            expected,
-            Vm::hob_memory_resources(
-                sections,
-                &GuestMemoryMmap::from_ranges(&guest_ranges).unwrap()
-            )
-        );
-
-        // Case 2: Two TDVF sections with no conflict with the RAM
-        let sections = vec![
-            arch::x86_64::tdx::TdvfSection {
-                address: 0x1000_1000,
-                size: 0x1000,
-                ..Default::default()
-            },
-            arch::x86_64::tdx::TdvfSection {
-                address: 0,
-                size: 0x1000,
-                ..Default::default()
-            },
-        ];
-        let guest_ranges: Vec<(GuestAddress, usize)> = vec![(GuestAddress(0x1000), 0x1000_0000)];
-        let expected = vec![
-            (0, 0x1000, false),
-            (0x1000, 0x1000_0000, true),
-            (0x1000_1000, 0x1000, false),
-        ];
-        assert_eq!(
-            expected,
-            Vm::hob_memory_resources(
-                sections,
-                &GuestMemoryMmap::from_ranges(&guest_ranges).unwrap()
-            )
-        );
-
-        // Case 3: Two TDVF sections with partial conflicts with the RAM
-        let sections = vec![
-            arch::x86_64::tdx::TdvfSection {
-                address: 0x1000_0000,
-                size: 0x2000,
-                ..Default::default()
-            },
-            arch::x86_64::tdx::TdvfSection {
-                address: 0,
-                size: 0x2000,
-                ..Default::default()
-            },
-        ];
-        let guest_ranges: Vec<(GuestAddress, usize)> = vec![(GuestAddress(0x1000), 0x1000_0000)];
-        let expected = vec![
-            (0, 0x2000, false),
-            (0x2000, 0x0fff_e000, true),
-            (0x1000_0000, 0x2000, false),
-        ];
-        assert_eq!(
-            expected,
-            Vm::hob_memory_resources(
-                sections,
-                &GuestMemoryMmap::from_ranges(&guest_ranges).unwrap()
-            )
-        );
-
-        // Case 4: Two TDVF sections with no conflict before the RAM and two
-        // more additional sections with no conflict after the RAM.
-        let sections = vec![
-            arch::x86_64::tdx::TdvfSection {
-                address: 0x2000_1000,
-                size: 0x1000,
-                ..Default::default()
-            },
-            arch::x86_64::tdx::TdvfSection {
-                address: 0x2000_0000,
-                size: 0x1000,
-                ..Default::default()
-            },
-            arch::x86_64::tdx::TdvfSection {
-                address: 0x1000,
-                size: 0x1000,
-                ..Default::default()
-            },
-            arch::x86_64::tdx::TdvfSection {
-                address: 0,
-                size: 0x1000,
-                ..Default::default()
-            },
-        ];
-        let guest_ranges: Vec<(GuestAddress, usize)> = vec![(GuestAddress(0x4000), 0x1000_0000)];
-        let expected = vec![
-            (0, 0x1000, false),
-            (0x1000, 0x1000, false),
-            (0x4000, 0x1000_0000, true),
-            (0x2000_0000, 0x1000, false),
-            (0x2000_1000, 0x1000, false),
-        ];
-        assert_eq!(
-            expected,
-            Vm::hob_memory_resources(
-                sections,
-                &GuestMemoryMmap::from_ranges(&guest_ranges).unwrap()
-            )
-        );
-
-        // Case 5: One TDVF section overriding the entire RAM
-        let sections = vec![arch::x86_64::tdx::TdvfSection {
-            address: 0,
-            size: 0x2000_0000,
-            ..Default::default()
-        }];
-        let guest_ranges: Vec<(GuestAddress, usize)> = vec![(GuestAddress(0x1000), 0x1000_0000)];
-        let expected = vec![(0, 0x2000_0000, false)];
-        assert_eq!(
-            expected,
-            Vm::hob_memory_resources(
-                sections,
-                &GuestMemoryMmap::from_ranges(&guest_ranges).unwrap()
-            )
-        );
-
-        // Case 6: Two TDVF sections with no conflict with 2 RAM regions
-        let sections = vec![
-            arch::x86_64::tdx::TdvfSection {
-                address: 0x1000_2000,
-                size: 0x2000,
-                ..Default::default()
-            },
-            arch::x86_64::tdx::TdvfSection {
-                address: 0,
-                size: 0x2000,
-                ..Default::default()
-            },
-        ];
-        let guest_ranges: Vec<(GuestAddress, usize)> = vec![
-            (GuestAddress(0x2000), 0x1000_0000),
-            (GuestAddress(0x1000_4000), 0x1000_0000),
-        ];
-        let expected = vec![
-            (0, 0x2000, false),
-            (0x2000, 0x1000_0000, true),
-            (0x1000_2000, 0x2000, false),
-            (0x1000_4000, 0x1000_0000, true),
-        ];
-        assert_eq!(
-            expected,
-            Vm::hob_memory_resources(
-                sections,
-                &GuestMemoryMmap::from_ranges(&guest_ranges).unwrap()
-            )
-        );
-
-        // Case 7: Two TDVF sections with partial conflicts with 2 RAM regions
-        let sections = vec![
-            arch::x86_64::tdx::TdvfSection {
-                address: 0x1000_0000,
-                size: 0x4000,
-                ..Default::default()
-            },
-            arch::x86_64::tdx::TdvfSection {
-                address: 0,
-                size: 0x4000,
-                ..Default::default()
-            },
-        ];
-        let guest_ranges: Vec<(GuestAddress, usize)> = vec![
-            (GuestAddress(0x1000), 0x1000_0000),
-            (GuestAddress(0x1000_3000), 0x1000_0000),
-        ];
-        let expected = vec![
-            (0, 0x4000, false),
-            (0x4000, 0x0fff_c000, true),
-            (0x1000_0000, 0x4000, false),
-            (0x1000_4000, 0x0fff_f000, true),
-        ];
-        assert_eq!(
-            expected,
-            Vm::hob_memory_resources(
-                sections,
-                &GuestMemoryMmap::from_ranges(&guest_ranges).unwrap()
-            )
-        );
     }
 
     #[test]
@@ -4071,7 +3440,7 @@ mod tests {
 
         let hv = hypervisor::new().unwrap();
         let vm = hv.create_vm(HypervisorVmConfig::default()).unwrap();
-        let vgic_config = Gic::create_default_config(1);
+        let vgic_config = Gic::create_default_config(1).unwrap();
         let gic = vm.create_vgic(&vgic_config).expect("Cannot create gic");
         arch::aarch64::fdt::create_fdt(
             &mem,
@@ -4085,6 +3454,7 @@ mod tests {
             &BTreeMap::new(),
             None,
             true,
+            false,
             None,
         )
         .unwrap();

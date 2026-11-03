@@ -58,9 +58,10 @@ use crate::coredump::{
 };
 use crate::migration::transport::SocketStream;
 use crate::migration::url_to_path;
-use crate::sparse::{next_data_extent, write_region_sparse};
+use crate::pagemap::PageMap;
+use crate::sparse::{clone_file_range, next_data_extent, write_region_sparse};
 use crate::uffd::{
-    self, FileUffdMemorySource, SocketUffdMemorySource, UffdMemorySource, UffdRange,
+    self, FileUffdMemorySource, SocketUffdMemorySource, Uffd, UffdMemorySource, UffdRange,
 };
 use crate::vm_config::{HotplugMethod, MemoryConfig, MemoryZoneConfig};
 use crate::{GuestMemoryMmap, GuestRegionMmap, MEMORY_MANAGER_SNAPSHOT_ID, prefault, userfaultfd};
@@ -77,7 +78,8 @@ pub const MEMORY_MANAGER_ACPI_SIZE: usize = 0x18;
 
 const DEFAULT_MEMORY_ZONE: &str = "mem0";
 
-const SNAPSHOT_FILENAME: &str = "memory-ranges";
+/// Filename used to store guest RAM in snapshot directories.
+pub const SNAPSHOT_FILENAME: &str = "memory-ranges";
 
 #[cfg(target_arch = "x86_64")]
 const X86_64_IRQ_BASE: u32 = 5;
@@ -236,6 +238,13 @@ fn size_clear_of_reserved(regions: &[ArchMemRegion], base: u64, size: u64) -> Re
     Ok(end - base)
 }
 
+// The snapshot memory file a copy-on-write restore mapped guest RAM from.
+struct CowSource {
+    file: File,
+    ranges: MemoryRangeTable,
+    pagemap: PageMap,
+}
+
 pub struct MemoryManager {
     boot_guest_memory: GuestMemoryMmap,
     guest_memory: GuestMemoryAtomic<GuestMemoryMmap>,
@@ -262,6 +271,7 @@ pub struct MemoryManager {
     thp: bool,
     user_provided_zones: bool,
     snapshot_memory_ranges: MemoryRangeTable,
+    cow_source: Option<CowSource>,
     memory_zones: MemoryZones,
     log_dirty: bool, // Enable dirty logging for created RAM regions
     arch_mem_regions: Vec<ArchMemRegion>,
@@ -512,8 +522,7 @@ fn statfs_get_bsize(path: &str) -> Result<u64, Error> {
 }
 
 fn memory_zone_get_align_size(zone: &MemoryZoneConfig) -> Result<u64, Error> {
-    // SAFETY: FFI call. Trivially safe.
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 };
+    let page_size = get_page_size();
 
     // There is no backend file and the `hugepages` is disabled, just use system page size.
     if zone.file.is_none() && !zone.hugepages {
@@ -1028,7 +1037,20 @@ impl MemoryManager {
                 "snapshot memory file is shorter than the saved ranges",
             )));
         }
-        do_mmap_cow_saved_regions(&guest_memory, &memory_file, saved_regions, self.thp)
+        do_mmap_cow_saved_regions(&guest_memory, &memory_file, saved_regions, self.thp)?;
+        // Landlock applies after the restore, so the pagemap is opened here.
+        self.cow_source = match PageMap::open() {
+            Ok(pagemap) => Some(CowSource {
+                file: memory_file,
+                ranges: saved_regions.clone(),
+                pagemap,
+            }),
+            Err(e) => {
+                warn!("Restore (mode=copyonwrite): snapshots will write all guest memory: {e}");
+                None
+            }
+        };
+        Ok(())
     }
 
     /// Restore guest memory using userfaultfd for lazy demand paging.
@@ -1061,7 +1083,7 @@ impl MemoryManager {
             snapshot_file.try_clone().map_err(Error::SnapshotOpen)?,
         ));
 
-        let Some((uffd_fd, ranges)) = self.prepare_uffd(
+        let Some(uffd) = self.prepare_uffd(
             saved_regions,
             |r| {
                 let o = file_offset;
@@ -1076,7 +1098,8 @@ impl MemoryManager {
         // Per-range bitmap tracking which pages have been populated by the
         // on-demand fault handler. Lets the prefault cursor skip them without
         // doing a wasted file read + UFFDIO_COPY.
-        let served_bitmap: Vec<AtomicBitmap> = ranges
+        let served_bitmap: Vec<AtomicBitmap> = uffd
+            .ranges()
             .iter()
             .map(|r| {
                 AtomicBitmap::new(
@@ -1087,7 +1110,7 @@ impl MemoryManager {
             .collect();
 
         // For sparse files, we mark holes as served pages so we don't prefault them.
-        for (range, served) in ranges.iter().zip(&served_bitmap) {
+        for (range, served) in uffd.ranges().iter().zip(&served_bitmap) {
             let end = range.source_offset + range.length;
             let mut file_cursor = range.source_offset;
             while let Ok(next) = next_data_extent(snapshot_file.as_fd(), file_cursor, end) {
@@ -1105,7 +1128,7 @@ impl MemoryManager {
             }
         }
 
-        self.spawn_uffd_handler(uffd_fd, None, ranges, served_bitmap, source, exit_evt)?;
+        self.spawn_uffd_handler(uffd, None, served_bitmap, source, exit_evt, true)?;
         info!("UFFD restore: demand-paged restore enabled");
         Ok(())
     }
@@ -1116,6 +1139,7 @@ impl MemoryManager {
         &mut self,
         saved_regions: &MemoryRangeTable,
         shared_backing: bool,
+        background_fetch_pages: bool,
         socket: SocketStream,
         exit_evt: &EventFd,
     ) -> Result<(), Error> {
@@ -1129,13 +1153,14 @@ impl MemoryManager {
             Box::new(SocketUffdMemorySource::new(socket, shared_backing));
 
         // PageFault uses the GPA as the page identifier on the wire.
-        let Some((uffd_fd, ranges)) =
+        let Some(uffd) =
             self.prepare_uffd(saved_regions, |r| r.gpa, source.requires_uffd_minor_mode())?
         else {
             return Ok(());
         };
 
-        let served_bitmap: Vec<AtomicBitmap> = ranges
+        let served_bitmap: Vec<AtomicBitmap> = uffd
+            .ranges()
             .iter()
             .map(|r| {
                 AtomicBitmap::new(
@@ -1144,13 +1169,14 @@ impl MemoryManager {
                 )
             })
             .collect();
+        info!("UFFD: postcopy background prefault {background_fetch_pages}");
         self.spawn_uffd_handler(
-            uffd_fd,
+            uffd,
             Some(socket_fd),
-            ranges,
             served_bitmap,
             source,
             exit_evt,
+            background_fetch_pages,
         )
     }
 
@@ -1160,7 +1186,7 @@ impl MemoryManager {
         saved_regions: &MemoryRangeTable,
         mut source_offset_for: F,
         uffd_requires_minor_mode: bool,
-    ) -> Result<Option<(OwnedFd, Vec<UffdRange>)>, Error>
+    ) -> Result<Option<Uffd>, Error>
     where
         F: FnMut(&MemoryRange) -> u64,
     {
@@ -1171,19 +1197,17 @@ impl MemoryManager {
         let guest_memory = self.guest_memory.memory();
         let required_uffd_features = self.required_uffd_features(uffd_requires_minor_mode);
 
-        // SAFETY: FFI call. Trivially safe.
-        let base_page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+        let base_page_size = get_page_size();
 
         info!(
             "UFFD: registering {} region(s) for demand paging",
             saved_regions.ranges().len()
         );
 
-        if saved_regions
-            .ranges()
-            .iter()
-            .any(|range| range.gpa % base_page_size != 0 || range.length % base_page_size != 0)
-        {
+        if saved_regions.ranges().iter().any(|range| {
+            !range.gpa.is_multiple_of(base_page_size)
+                || !range.length.is_multiple_of(base_page_size)
+        }) {
             return Err(UffdError::UnalignedRanges.into());
         }
 
@@ -1192,8 +1216,10 @@ impl MemoryManager {
         let mut handler_ranges: Vec<UffdRange> = Vec::new();
 
         for range in saved_regions.ranges() {
+            // The range must not span across multiple guest RAM regions
             let host_addr = guest_memory
-                .get_host_address(GuestAddress(range.gpa))
+                .get_slice(GuestAddress(range.gpa), range.length as usize)
+                .and_then(|_| guest_memory.get_host_address(GuestAddress(range.gpa)))
                 .map_err(|e| UffdError::GpaTranslation {
                     gpa: range.gpa,
                     source: e,
@@ -1239,22 +1265,24 @@ impl MemoryManager {
             });
         }
 
-        Ok(Some((uffd_fd, handler_ranges)))
+        Ok(Some(
+            Uffd::new(uffd_fd, handler_ranges.into()).map_err(UffdError::Create)?,
+        ))
     }
 
     /// Spawn the UFFD handler thread that resolves faults through `source`.
     fn spawn_uffd_handler(
         &mut self,
-        uffd_fd: OwnedFd,
+        uffd: Uffd,
         fault_socket_fd: Option<OwnedFd>,
-        handler_ranges: Vec<UffdRange>,
         served_bitmap: Vec<AtomicBitmap>,
         source: Box<dyn UffdMemorySource>,
         exit_evt: &EventFd,
+        background_fetch_pages: bool,
     ) -> Result<(), Error> {
         info!(
             "UFFD: spawning handler for {} region(s)",
-            handler_ranges.len()
+            uffd.ranges().len()
         );
 
         let stop_event = EventFd::new(libc::EFD_NONBLOCK).map_err(Error::EventFdFail)?;
@@ -1270,14 +1298,14 @@ impl MemoryManager {
             .spawn(move || {
                 panic::catch_unwind(panic::AssertUnwindSafe(move || {
                     let mut result = Self::uffd_handler_loop(
-                        uffd_fd,
+                        &[uffd],
                         &thread_stop_event,
                         &thread_exit_evt,
                         source,
-                        &handler_ranges,
                         served_bitmap,
                         &ready_tx,
                         &thread_prefault_complete,
+                        background_fetch_pages,
                     );
 
                     if result.is_err() && thread_stop_event.read().is_ok() {
@@ -1386,21 +1414,22 @@ impl MemoryManager {
         }
     }
 
-    /// Serve UFFD faults via `source`, prefaulting one page per idle
-    /// iteration. Once `source` fails, poison each faulted page instead.
-    #[expect(clippy::needless_pass_by_value)]
-    #[expect(clippy::too_many_arguments)]
+    /// Serve UFFD faults from every userfaultfd in `uffds` via `source`,
+    /// prefaulting one page per idle iteration through the first one. Once
+    /// `source` fails, poison each faulted page instead.
+    #[expect(clippy::needless_pass_by_value, clippy::too_many_arguments)]
     fn uffd_handler_loop(
-        uffd_fd: OwnedFd,
+        uffds: &[Uffd],
         stop_event: &EventFd,
         exit_evt: &EventFd,
         mut source: Box<dyn UffdMemorySource>,
-        ranges: &[UffdRange],
         served_bitmap: Vec<AtomicBitmap>,
         ready_tx: &SyncSender<()>,
         prefault_complete: &AtomicBool,
+        background_fetch_pages: bool,
     ) -> Result<(), io::Error> {
-        let uffd_raw_fd = uffd_fd.as_raw_fd();
+        let vmm_uffd = &uffds[0];
+        let ranges = vmm_uffd.ranges();
 
         let total_pages: u64 = ranges.iter().map(UffdRange::num_pages).sum();
         let mut pages_served: u64 = 0;
@@ -1408,14 +1437,17 @@ impl MemoryManager {
 
         let pages_loading: Mutex<HashSet<(usize, u64)>> = Mutex::new(HashSet::new());
 
-        let mut prefault_active = !ranges.is_empty();
+        let zero_buf = uffd::allocate_zero_buffer(
+            ranges.iter().map(|r| r.page_size).max().unwrap_or(0) as usize,
+        );
+
+        let mut prefault_active = background_fetch_pages && !ranges.is_empty();
         let mut source_failed = false;
         let mut range_idx = 0;
         let mut page_idx = 0;
         let prefault_start = time::Instant::now();
 
-        const EVENT_STOP: u64 = 0;
-        const EVENT_UFFD: u64 = 1;
+        const EVENT_STOP: u64 = u64::MAX;
 
         let epoll_fd = epoll::create(true).map_err(io::Error::other)?;
         // SAFETY: epoll_fd is valid and owned by this scope.
@@ -1429,17 +1461,19 @@ impl MemoryManager {
         )
         .map_err(io::Error::other)?;
 
-        epoll::ctl(
-            epoll_fd,
-            epoll::ControlOptions::EPOLL_CTL_ADD,
-            uffd_raw_fd,
-            epoll::Event::new(epoll::Events::EPOLLIN | epoll::Events::EPOLLHUP, EVENT_UFFD),
-        )
-        .map_err(io::Error::other)?;
+        for (idx, uffd) in uffds.iter().enumerate() {
+            epoll::ctl(
+                epoll_fd,
+                epoll::ControlOptions::EPOLL_CTL_ADD,
+                uffd.fd().as_raw_fd(),
+                epoll::Event::new(epoll::Events::EPOLLIN, idx as u64),
+            )
+            .map_err(io::Error::other)?;
+        }
 
         ready_tx.send(()).ok();
 
-        let mut events = vec![epoll::Event::new(epoll::Events::empty(), 0); 2];
+        let mut events = vec![epoll::Event::new(epoll::Events::empty(), 0); uffds.len() + 1];
         loop {
             // Block only when prefault is done; otherwise poll non-blocking
             // so we can advance prefault between faults.
@@ -1462,31 +1496,25 @@ impl MemoryManager {
                 return Ok(());
             }
 
-            let mut got_uffd_data = false;
+            let mut ready_uffd = None;
             for event in events.iter().take(num_events) {
-                let token = event.data;
+                let idx = event.data as usize;
                 let evt_flags = event.events;
 
-                if token == EVENT_UFFD
-                    && (evt_flags & epoll::Events::EPOLLHUP.bits()) != 0
-                    && (evt_flags & epoll::Events::EPOLLIN.bits()) == 0
-                {
-                    debug!("UFFD handler: fd closed (EPOLLHUP), exiting");
-                    return Ok(());
-                }
-
-                if token == EVENT_UFFD && (evt_flags & epoll::Events::EPOLLIN.bits()) != 0 {
-                    got_uffd_data = true;
+                if (evt_flags & epoll::Events::EPOLLIN.bits()) != 0 {
+                    ready_uffd = Some(idx);
+                    break;
                 }
             }
 
-            if got_uffd_data {
+            if let Some(idx) = ready_uffd {
+                let fault_uffd = &uffds[idx];
                 // SAFETY: UffdMsg is a plain repr(C) struct, safe to zero-init.
                 let mut msg: uffd::UffdMsg = unsafe { zeroed() };
                 // SAFETY: reading a uffd_msg-sized struct from the valid uffd fd.
                 let n = unsafe {
                     libc::read(
-                        uffd_raw_fd,
+                        fault_uffd.fd().as_raw_fd(),
                         (&raw mut msg).cast(),
                         size_of::<uffd::UffdMsg>(),
                     )
@@ -1497,10 +1525,6 @@ impl MemoryManager {
                         continue;
                     }
                     return Err(err);
-                }
-                if n == 0 {
-                    debug!("UFFD handler: EOF on fd, exiting");
-                    return Ok(());
                 }
                 if n as usize != size_of::<uffd::UffdMsg>() {
                     return Err(io::Error::new(
@@ -1516,44 +1540,53 @@ impl MemoryManager {
                 let fault_addr = msg.pf_address;
                 let minor_fault = msg.pf_flags & userfaultfd::UFFD_PAGEFAULT_FLAG_MINOR != 0;
 
-                // Find the corresponding page info from the fault address
-                let (range, range_idx, page_idx) = ranges
-                    .iter()
-                    .enumerate()
-                    .find_map(|(range_idx, uffd_range)| {
-                        uffd_range.page_index_of(fault_addr).map(|page_idx| (uffd_range, range_idx, page_idx))
-                    })
-                    .ok_or_else(|| io::Error::other(format!(
+                let (range_idx, page_idx) = fault_uffd.locate(fault_addr).ok_or_else(|| {
+                    io::Error::other(format!(
                         "UFFD handler: fault at {fault_addr:#x} does not belong to any registered range",
-                    )))?;
+                    ))
+                })?;
+                let range = &fault_uffd.ranges()[range_idx];
 
                 if source_failed {
-                    Self::uffd_poison_page(uffd_fd.as_fd(), range, page_idx)?;
+                    Self::uffd_poison_page(fault_uffd.fd(), range, page_idx)?;
+                    continue;
+                }
+
+                // A missing fault on a served page is either a discard, or a
+                // fault queued on another userfaultfd while the page was
+                // being resolved. Only the latter leaves the page present.
+                if !minor_fault
+                    && served_bitmap[range_idx].is_bit_set(page_idx as usize)
+                    && uffd::page_present(ranges[range_idx].page_addr(page_idx))?
+                {
+                    uffd::wake(fault_uffd.fd(), range.page_addr(page_idx), range.page_size)?;
                     continue;
                 }
 
                 let key = (range_idx, page_idx);
 
-                let served_minor = {
+                let (served_minor, discarded) = {
                     let mut loading = pages_loading.lock().unwrap();
                     let served = served_bitmap[range_idx].is_bit_set(page_idx as usize);
 
                     if served && minor_fault {
-                        true
+                        (true, false)
+                    } else if served {
+                        // The page has been discarded (ie. virtio-balloon)
+                        (false, true)
                     } else if !loading.insert(key) {
                         // Another worker owns this page. The thread that's
                         // handling this page will call UFFDIO_COPY or
                         // UFFDIO_CONTINUE on the page range. The kernel
                         // guarantees us that it will wake all the threads
-                        // waiting on this range, so we don't need to do
-                        // anything here.
+                        // waiting on this range in the userfaultfd it
+                        // resolves through. This fault may come from another
+                        // one, so wake it right away: it faults again until
+                        // the page is resolved.
+                        uffd::wake(fault_uffd.fd(), range.page_addr(page_idx), range.page_size)?;
                         continue;
                     } else {
-                        if served {
-                            // The page has been discarded (ie. virtio-balloon)
-                            served_bitmap[range_idx].reset_bit(page_idx as usize);
-                        }
-                        false
+                        (false, false)
                     }
                 };
 
@@ -1561,7 +1594,7 @@ impl MemoryManager {
                     // The backing page is already in the page cache. A
                     // minor fault only needs the page mapped into this VMA.
                     uffd::uffd_continue(
-                        uffd_fd.as_fd(),
+                        fault_uffd.fd(),
                         range.page_addr(page_idx),
                         range.page_size,
                     )
@@ -1577,7 +1610,30 @@ impl MemoryManager {
                     continue;
                 }
 
-                let result = source.resolve(uffd_fd.as_fd(), range, page_idx);
+                if discarded {
+                    let page_addr = range.page_addr(page_idx);
+                    match uffd::zeropage(fault_uffd.fd(), page_addr, range.page_size) {
+                        // hugetlbfs does not support UFFDIO_ZEROPAGE.
+                        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => uffd::copy(
+                            fault_uffd.fd(),
+                            page_addr,
+                            zero_buf.as_ptr(),
+                            range.page_size,
+                        ),
+                        result => result,
+                    }
+                    .or_else(|e| {
+                        if e.raw_os_error() == Some(libc::EEXIST) {
+                            uffd::wake(fault_uffd.fd(), page_addr, range.page_size)
+                        } else {
+                            Err(e)
+                        }
+                    })?;
+
+                    continue;
+                }
+
+                let result = source.resolve(fault_uffd.fd(), range, page_idx);
 
                 {
                     let mut loading = pages_loading.lock().unwrap();
@@ -1597,10 +1653,29 @@ impl MemoryManager {
                     exit_evt.write(1).ok();
                     prefault_active = false;
                     source_failed = true;
-                    Self::uffd_poison_page(uffd_fd.as_fd(), range, page_idx)?;
+                    Self::uffd_poison_page(fault_uffd.fd(), range, page_idx)?;
                     continue;
                 }
                 pages_served += 1;
+
+                // preemptively fault that page in the guest, as it's very
+                // likely it's going to access it soon, causing minor fault
+                // if it's enabled.
+                let is_backend_fault = idx != 0;
+                if is_backend_fault && source.requires_uffd_minor_mode() {
+                    uffd::uffd_continue(
+                        vmm_uffd.fd(),
+                        ranges[range_idx].page_addr(page_idx),
+                        range.page_size,
+                    )
+                    .or_else(|e| {
+                        if e.raw_os_error() == Some(libc::EEXIST) {
+                            Ok(())
+                        } else {
+                            Err(e)
+                        }
+                    })?;
+                }
 
                 continue;
             }
@@ -1610,7 +1685,7 @@ impl MemoryManager {
             }
 
             match Self::uffd_prefault(
-                uffd_fd.as_fd(),
+                vmm_uffd.fd(),
                 &mut range_idx,
                 &mut page_idx,
                 ranges,
@@ -1960,7 +2035,7 @@ impl MemoryManager {
         config: &MemoryConfig,
         prefault: Option<bool>,
         phys_bits: u8,
-        #[cfg(feature = "tdx")] tdx_enabled: bool,
+        #[cfg(feature = "sev_snp")] sev_snp_enabled: bool,
         restore_data: Option<&MemoryManagerSnapshotData>,
         existing_memory_files: HashMap<u32, File>,
     ) -> Result<Arc<Mutex<MemoryManager>>, Error> {
@@ -2155,10 +2230,10 @@ impl MemoryManager {
             .ok_or(Error::CreateSystemAllocator)?,
         ));
 
-        #[cfg(not(feature = "tdx"))]
+        #[cfg(not(feature = "sev_snp"))]
         let dynamic = true;
-        #[cfg(feature = "tdx")]
-        let dynamic = !tdx_enabled;
+        #[cfg(feature = "sev_snp")]
+        let dynamic = !sev_snp_enabled;
 
         let acpi_address = if dynamic
             && config.hotplug_method == HotplugMethod::Acpi
@@ -2205,11 +2280,12 @@ impl MemoryManager {
             reserve: config.reserve,
             user_provided_zones,
             snapshot_memory_ranges: MemoryRangeTable::default(),
+            cow_source: None,
             memory_zones,
             guest_ram_mappings: Vec::new(),
             uffd_handler: None,
             acpi_address,
-            log_dirty: dynamic, // Cannot log dirty pages on a TD
+            log_dirty: dynamic, // Cannot log dirty pages on a CVM
             arch_mem_regions,
             ram_allocator,
             dynamic,
@@ -2231,6 +2307,7 @@ impl MemoryManager {
         memory_restore_mode: MemoryRestoreMode,
         phys_bits: u8,
         exit_evt: &EventFd,
+        #[cfg(feature = "sev_snp")] sev_snp_enabled: bool,
     ) -> Result<Arc<Mutex<MemoryManager>>, Error> {
         if let Some(source_url) = source_url {
             let mut memory_file_path = url_to_path(source_url).map_err(Error::Restore)?;
@@ -2244,8 +2321,8 @@ impl MemoryManager {
                 config,
                 Some(prefault),
                 phys_bits,
-                #[cfg(feature = "tdx")]
-                false,
+                #[cfg(feature = "sev_snp")]
+                sev_snp_enabled,
                 Some(&mem_snapshot),
                 Default::default(),
             )?;
@@ -2319,7 +2396,7 @@ impl MemoryManager {
         hugepage_size: Option<u64>,
     ) -> Result<FileOffset, Error> {
         let fd = Self::memfd_create(
-            &ffi::CString::new("ch_ram").unwrap(),
+            c"ch_ram",
             libc::MFD_CLOEXEC
                 | libc::MFD_ALLOW_SEALING
                 | if hugepages {
@@ -2519,8 +2596,7 @@ impl MemoryManager {
         hugepages: bool,
         hugepage_size: Option<u64>,
     ) -> Result<u64, Error> {
-        // SAFETY: FFI call. Trivially safe.
-        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 };
+        let page_size = get_page_size();
         match (hugepages, hugepage_size, backing_file) {
             (false, _, _) => Ok(page_size),
             (true, Some(hugepage_size), _) => Ok(hugepage_size),
@@ -3068,6 +3144,8 @@ impl MemoryManager {
             }
         }
 
+        // Memory zones iterate in hash order.
+        table.sort();
         Ok(table)
     }
 
@@ -3657,6 +3735,19 @@ impl Transportable for MemoryManager {
             .map(|r| r.length)
             .sum();
 
+        let guest_memory = self.guest_memory.memory();
+
+        if let Some(source) = &self.cow_source
+            && source.ranges == self.snapshot_memory_ranges
+        {
+            match clone_file_range(&source.file, &memory_file, total_len) {
+                Ok(()) => return write_private_pages(&guest_memory, source, &mut memory_file),
+                Err(e) => {
+                    warn!("Snapshot: restore source not cloned, writing all guest memory: {e}");
+                }
+            }
+        }
+
         // Pre-size the file so per-region write_at lands at the dense-layout
         // offset. On filesystems that support sparse files unwritten bytes
         // become real holes; on others the kernel zero-fills the allocation,
@@ -3666,7 +3757,6 @@ impl Transportable for MemoryManager {
         // write path which never writes past the growing EOF.
         let sparse_layout = memory_file.set_len(total_len).is_ok();
 
-        let guest_memory = self.guest_memory.memory();
         let mut file_cursor: u64 = 0;
 
         for range in self.snapshot_memory_ranges.ranges() {
@@ -3695,30 +3785,14 @@ impl Transportable for MemoryManager {
 
             if !wrote_sparse {
                 // Dense fallback: anonymous mmap or hugetlbfs (no
-                // SEEK_HOLE). Match the dense layout by seeking to
-                // file_cursor and streaming bytes via the existing
-                // volatile copy.
-                memory_file
-                    .seek(SeekFrom::Start(file_cursor))
-                    .context("Error seeking memory snapshot file")
-                    .map_err(MigratableError::MigrateSend)?;
-                let mut offset: u64 = 0;
-                // Manual partial-write loop preserves the workaround for
-                // https://github.com/rust-vmm/vm-memory/issues/174
-                loop {
-                    let bytes_written = guest_memory
-                        .write_volatile_to(
-                            GuestAddress(range.gpa + offset),
-                            &mut memory_file,
-                            (range.length - offset) as usize,
-                        )
-                        .context("Error writing dense memory snapshot region")
-                        .map_err(MigratableError::MigrateSend)?;
-                    offset += bytes_written as u64;
-                    if offset == range.length {
-                        break;
-                    }
-                }
+                // SEEK_HOLE).
+                write_guest_range(
+                    &guest_memory,
+                    &mut memory_file,
+                    file_cursor,
+                    range.gpa,
+                    range.length,
+                )?;
             }
 
             file_cursor += range.length;
@@ -3802,6 +3876,62 @@ impl Migratable for MemoryManager {
     }
 }
 
+// Streams guest memory `[gpa, gpa + length)` into `file` at `file_offset`.
+fn write_guest_range(
+    guest_memory: &GuestMemoryMmap,
+    file: &mut File,
+    file_offset: u64,
+    gpa: u64,
+    length: u64,
+) -> result::Result<(), MigratableError> {
+    file.seek(SeekFrom::Start(file_offset))
+        .context("Error seeking memory snapshot file")
+        .map_err(MigratableError::MigrateSend)?;
+    let mut offset: u64 = 0;
+    // Manual partial-write loop preserves the workaround for
+    // https://github.com/rust-vmm/vm-memory/issues/174
+    while offset < length {
+        let bytes_written = guest_memory
+            .write_volatile_to(GuestAddress(gpa + offset), file, (length - offset) as usize)
+            .context("Error writing memory snapshot region")
+            .map_err(MigratableError::MigrateSend)?;
+        offset += bytes_written as u64;
+    }
+    Ok(())
+}
+
+// Writes the guest pages that no longer read from the restore source over
+// the clone of that source in `file`.
+fn write_private_pages(
+    guest_memory: &GuestMemoryMmap,
+    source: &CowSource,
+    file: &mut File,
+) -> result::Result<(), MigratableError> {
+    let mut file_offset: u64 = 0;
+    for range in source.ranges.ranges() {
+        let host_addr = guest_memory
+            .get_host_address(GuestAddress(range.gpa))
+            .context("Error locating guest memory range")
+            .map_err(MigratableError::MigrateSend)?;
+        let private_ranges = source
+            .pagemap
+            .private_ranges(host_addr as u64, range.length)
+            .context("Error reading the pagemap")
+            .map_err(MigratableError::MigrateSend)?;
+        for private in private_ranges {
+            write_guest_range(
+                guest_memory,
+                file,
+                file_offset + private.start,
+                range.gpa + private.start,
+                private.end - private.start,
+            )?;
+        }
+        file_offset += range.length;
+    }
+    Ok(())
+}
+
 // Reports whether every saved range is page-aligned and lies wholly inside a
 // single plain private-anonymous guest region — the MAP_FIXED overlay
 // preconditions. File-backed regions are rejected: their stale mapping
@@ -3810,8 +3940,7 @@ fn is_restore_cow_compatible(
     guest_memory: &GuestMemoryMmap,
     saved_regions: &MemoryRangeTable,
 ) -> bool {
-    // SAFETY: sysconf(_SC_PAGESIZE) has no failure mode relevant here.
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    let page_size = get_page_size();
     let mut file_offset: u64 = 0;
     for range in saved_regions.ranges() {
         if !file_offset.is_multiple_of(page_size)
@@ -3934,6 +4063,7 @@ mod tests {
     }
 
     use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::unix::fs::FileExt;
 
     use vm_migration::protocol::{MemoryRange, MemoryRangeTable};
 
@@ -3969,11 +4099,6 @@ mod tests {
         }
     }
 
-    fn page_size() -> u64 {
-        // SAFETY: sysconf(_SC_PAGESIZE) has no failure mode relevant here.
-        unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 }
-    }
-
     fn new_served_bitmap(ranges: &[UffdRange]) -> Vec<AtomicBitmap> {
         ranges
             .iter()
@@ -3988,7 +4113,7 @@ mod tests {
 
     #[test]
     fn uffd_prefault_skips_present_pages_and_crosses_ranges() {
-        let page = page_size();
+        let page = get_page_size();
         let ranges = [
             UffdRange {
                 host_addr: 0x10_0000,
@@ -4068,7 +4193,7 @@ mod tests {
 
     #[test]
     fn uffd_prefault_retries_page_after_source_failure() {
-        let page = page_size();
+        let page = get_page_size();
         let ranges = [UffdRange {
             host_addr: 0x10_0000,
             length: page,
@@ -4125,7 +4250,7 @@ mod tests {
 
     #[test]
     fn cow_restore_maps_data_and_reads_holes_as_zero() {
-        let page = page_size();
+        let page = get_page_size();
         let gm = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), (2 * page) as usize)]).unwrap();
 
         let mut file = tempfile::tempfile().unwrap();
@@ -4156,8 +4281,46 @@ mod tests {
     }
 
     #[test]
+    fn cow_snapshot_writes_private_pages_over_the_source() {
+        let page = get_page_size();
+        let gm = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), (16 * page) as usize)]).unwrap();
+        let mut file = tempfile::tempfile().unwrap();
+        for i in 0..16u8 {
+            file.write_all(&vec![i + 1; page as usize]).unwrap();
+        }
+        let mut ranges = MemoryRangeTable::default();
+        ranges.push(MemoryRange {
+            gpa: 0,
+            length: 16 * page,
+        });
+        do_mmap_cow_saved_regions(&gm, &file, &ranges, false).unwrap();
+        let source = CowSource {
+            file,
+            ranges,
+            pagemap: PageMap::open().unwrap(),
+        };
+        gm.write_obj::<u8>(0x55, GuestAddress(page)).unwrap();
+        gm.write_obj::<u8>(0x77, GuestAddress(12 * page + 9))
+            .unwrap();
+
+        let mut snapshot = tempfile::tempfile().unwrap();
+        let mut content = vec![0u8; (16 * page) as usize];
+        source.file.read_exact_at(&mut content, 0).unwrap();
+        snapshot.write_all(&content).unwrap();
+        write_private_pages(&gm, &source, &mut snapshot).unwrap();
+
+        let mut got = vec![0u8; (16 * page) as usize];
+        snapshot.read_exact_at(&mut got, 0).unwrap();
+        let mut want = vec![0u8; (16 * page) as usize];
+        gm.read_slice(&mut want, GuestAddress(0)).unwrap();
+        assert!(got == want);
+        assert_eq!(content[page as usize], 2);
+        assert_eq!(got[page as usize], 0x55);
+    }
+
+    #[test]
     fn cow_restore_rejects_unaligned_or_out_of_region_ranges() {
-        let page = page_size();
+        let page = get_page_size();
         let gm = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), page as usize)]).unwrap();
 
         let mut unaligned = MemoryRangeTable::default();
@@ -4177,7 +4340,7 @@ mod tests {
 
     #[test]
     fn cow_restore_rejects_file_backed_region() {
-        let page = page_size();
+        let page = get_page_size();
         let backing = tempfile::tempfile().unwrap();
         backing.set_len(page).unwrap();
         let region = MmapRegion::build(
@@ -4202,7 +4365,7 @@ mod tests {
 
     #[test]
     fn cow_restore_honors_region_reserve_and_thp() {
-        let page = page_size();
+        let page = get_page_size();
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(&vec![0xcdu8; page as usize]).unwrap();
 

@@ -7,31 +7,35 @@
 // Copyright © 2023 Crusoe Energy Systems LLC
 //
 
+use std::fs::File;
 use std::os::unix::io::AsRawFd;
 
 use vmm_sys_util::eventfd::EventFd;
 
-use super::{operation_is_aligned, run_unaligned_operation};
 use crate::async_io::{
     AioDataIo, AsyncIo, AsyncIoCompletion, AsyncIoError, AsyncIoOperation, AsyncIoResult,
 };
 use crate::error::{BlockError, BlockErrorKind, BlockResult};
 use crate::sparse::{punch_hole, write_zeroes};
-use crate::{AlignedFile, is_block_device};
+use crate::{SECTOR_SIZE, is_block_device, probe_direct_alignment};
 
 pub(super) struct RawAio {
-    raw_file: AlignedFile,
+    raw_file: File,
     data_io: AioDataIo,
-    alignment: u64,
+    alignment: Option<u64>,
     is_block_device: bool,
 }
 
 impl RawAio {
-    pub(super) fn new(raw_file: AlignedFile, queue_depth: u32) -> BlockResult<Self> {
+    pub(super) fn new(raw_file: File, direct: bool, queue_depth: u32) -> BlockResult<Self> {
         let data_io =
             AioDataIo::new(queue_depth).map_err(|e| BlockError::new(BlockErrorKind::Io, e))?;
-        let is_block_device = is_block_device(raw_file.as_raw_fd());
-        let alignment = raw_file.alignment() as u64;
+        let is_block_device = is_block_device(&raw_file);
+        let alignment = if direct {
+            Some(probe_direct_alignment(&raw_file).unwrap_or(SECTOR_SIZE))
+        } else {
+            None
+        };
 
         Ok(RawAio {
             raw_file,
@@ -47,29 +51,21 @@ impl AsyncIo for RawAio {
         self.data_io.notifier()
     }
 
-    fn alignment(&self) -> u64 {
+    fn alignment(&self) -> Option<u64> {
         self.alignment
     }
 
     fn submit_data_operation(&mut self, op: AsyncIoOperation) -> AsyncIoResult<()> {
         let is_read = op.is_read();
 
-        if operation_is_aligned(&op, self.alignment) {
-            let fd = self.raw_file.as_raw_fd();
-            return self.data_io.submit_operation(fd, op).map_err(|e| {
-                if is_read {
-                    AsyncIoError::ReadVectored(e)
-                } else {
-                    AsyncIoError::WriteVectored(e)
-                }
-            });
-        }
-
-        let result = run_unaligned_operation(&self.raw_file, &op)?;
-        self.data_io
-            .inject_completion(AsyncIoCompletion::from_operation(op, result));
-
-        Ok(())
+        let fd = self.raw_file.as_raw_fd();
+        self.data_io.submit_operation(fd, op).map_err(|e| {
+            if is_read {
+                AsyncIoError::ReadVectored(e)
+            } else {
+                AsyncIoError::WriteVectored(e)
+            }
+        })
     }
 
     fn fsync(&mut self, user_data: Option<u64>) -> AsyncIoResult<()> {
@@ -79,8 +75,7 @@ impl AsyncIo for RawAio {
                 .submit_fsync(fd, user_data)
                 .map_err(AsyncIoError::Fsync)?;
         } else {
-            // SAFETY: FFI call with a valid fd
-            unsafe { libc::fsync(fd) };
+            self.raw_file.sync_all().map_err(AsyncIoError::Fsync)?;
         }
 
         Ok(())
@@ -124,8 +119,7 @@ mod tests {
     fn test_punch_hole() {
         let temp_file = TempFile::new().unwrap();
         let mut file = temp_file.into_file();
-        let mut async_io =
-            RawAio::new(AlignedFile::new(file.try_clone().unwrap(), false), 128).unwrap();
+        let mut async_io = RawAio::new(file.try_clone().unwrap(), false, 128).unwrap();
         test_helpers::test_punch_hole(&mut async_io, &mut file);
     }
 
@@ -133,8 +127,7 @@ mod tests {
     fn test_write_zeroes() {
         let temp_file = TempFile::new().unwrap();
         let mut file = temp_file.into_file();
-        let mut async_io =
-            RawAio::new(AlignedFile::new(file.try_clone().unwrap(), false), 128).unwrap();
+        let mut async_io = RawAio::new(file.try_clone().unwrap(), false, 128).unwrap();
         test_helpers::test_write_zeroes(&mut async_io, &mut file);
     }
 
@@ -142,8 +135,7 @@ mod tests {
     fn test_punch_hole_multiple_operations() {
         let temp_file = TempFile::new().unwrap();
         let mut file = temp_file.into_file();
-        let mut async_io =
-            RawAio::new(AlignedFile::new(file.try_clone().unwrap(), false), 128).unwrap();
+        let mut async_io = RawAio::new(file.try_clone().unwrap(), false, 128).unwrap();
         test_helpers::test_punch_hole_multiple_operations(&mut async_io, &mut file);
     }
 }
